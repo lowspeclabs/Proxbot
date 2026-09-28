@@ -214,7 +214,9 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(exit_code, cli.EXIT_SUCCESS)
         result = json.loads(stdout.getvalue())
         self.assertTrue(result["dry_run"])
-        self.assertEqual(result["data"]["body"], {"command": "uptime"})
+        self.assertEqual(result["data"]["body"], {"command": "uptime", "user": "root", "console": False})
+        # The console must not appear in the transport list unless requested.
+        self.assertEqual(result["data"]["target"]["transports"], ["ssh"])
 
     def test_lxc_exec_live(self):
         class Client:
@@ -224,7 +226,7 @@ class CliContractTests(unittest.TestCase):
             def get(self, endpoint):
                 return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
 
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -242,7 +244,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(result["data"]["exit_code"], 0)
 
     def test_lxc_exec_login_required(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password=None, no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password=None, no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -258,7 +260,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "login_required")
 
     def test_lxc_exec_console_unavailable(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -284,7 +286,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(result["status"], "console_unavailable")
 
     def test_lxc_exec_login_rejected_is_distinct_from_timeout(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -308,7 +310,7 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("rejected", result["error"])
 
     def test_lxc_exec_transport_failure_is_not_login_required(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -322,8 +324,84 @@ class CliContractTests(unittest.TestCase):
         result = json.loads(stderr.getvalue())
         self.assertEqual(result["status"], "console_unavailable")
 
+    def test_console_is_never_used_without_optin(self):
+        # Without --console, termproxy must not be called at all. The console is
+        # a single shared pty and attaching can type into a human's live shell.
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("lxc_exec must not be called without --console")
+
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
+                                  no_auto_inject_key=False, key_file=None, console=False, timeout=30,
+                                  execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _explode}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "console_not_requested")
+        self.assertIn("--console", result["error"])
+
+    def test_missing_console_attribute_defaults_to_no_console(self):
+        # Older callers build a Namespace without `console`; absent must mean
+        # "not requested", never "allowed".
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("lxc_exec must not be called when console is absent")
+
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
+                                  no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _explode}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        self.assertEqual(json.loads(stderr.getvalue())["status"], "console_not_requested")
+
+    def test_console_optin_does_not_bypass_ssh(self):
+        # With --console the SSH path still runs first and its result wins.
+        class Client:
+            def post(self, endpoint, body):
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": {"port": 5900, "ticket": "tick", "user": "root@pam"}, "error": None}
+
+            def get(self, endpoint):
+                if endpoint.endswith("/interfaces"):
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": [{"name": "eth0", "inet": "10.0.0.5/24"}], "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("termproxy must not be used when SSH succeeds")
+
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password="pw",
+                                  no_auto_inject_key=False, key_file="/nonexistent/key", console=True,
+                                  port=22, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_ssh_exec.__globals__, {"_run_ssh_command": lambda **kw: (0, "uptime ok\n", "")}), \
+             unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _explode}):
+            with contextlib.redirect_stdout(stdout):
+                exit_code = cli.cmd_lxc_exec(args, config, Client(), cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertIn("uptime ok", stdout.getvalue())
+
     def test_lxc_exec_with_password(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -566,7 +644,7 @@ class ConsoleOutputParsingTests(unittest.TestCase):
 
     def test_output_lost_is_distinct_from_transport_failure(self):
         args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
-                                  no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+                                  no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",

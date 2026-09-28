@@ -12,10 +12,11 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parents[1]
 # Known, intentional divergences from the pre-refactor script.
 # cmd_vm_exec: EXIT_API_ERROR (undefined constant) replaced with EXIT_API.
-# lxc_exec/cmd_lxc_exec: console auth diagnostics — a silent tty1 now reports
+# cmd_lxc_exec/lxc_exec: console auth diagnostics — a silent tty1 now reports
 #   console_unavailable instead of guessing login_failed/login_required, and
 #   credential rejection is distinguished from a post-login timeout.
-KNOWN_CHANGES = {"cmd_vm_exec", "lxc_exec", "cmd_lxc_exec"}
+# build_parser: `lxc exec` gained --console, so the termproxy fallback is opt-in.
+KNOWN_CHANGES = {"cmd_vm_exec", "lxc_exec", "cmd_lxc_exec", "build_parser"}
 
 ORIG = pathlib.Path("/tmp/opencode/Proxmox-cli.py.orig")
 # Only the CLI-side modules correspond to the original CLI script. The chat and

@@ -217,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_exec.add_argument("--password", help="Password for container console login")
     lxc_exec.add_argument("--key-file", help="SSH private key path for key injection / fallback")
     lxc_exec.add_argument("--no-auto-inject-key", action="store_true", help="Do not automatically inject SSH key after console login")
+    lxc_exec.add_argument("--console", action="store_true", help="Allow fallback to the container console (termproxy). The console is a single shared pty, so only pass this when you have confirmed no other session is attached.")
     lxc_delete = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("delete", help="Delete LXC (requires --execute --force --confirm)")), destructive=True)
     lxc_fix_console = _cmd(_add_node_vmid_args(lxc_sub.add_parser("fix-console", help="Print Debian 13 LXC console workaround")))
     lxc_fix_console.add_argument("--ostemplate", help="OS template (if not stored in config)")

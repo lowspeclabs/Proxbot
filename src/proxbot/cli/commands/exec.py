@@ -494,7 +494,18 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
     endpoint = f"/nodes/{node}/lxc/{vmid}/termproxy"
     guard = require_execute(args, f"lxc_exec:{node}:{vmid}")
     if guard is not None:
-        return emit_dry_run(args, logger, request_plan("TERMPROXY", endpoint, {"command": command}, {"node": node, "vmid": vmid, "command": command}))
+        return emit_dry_run(args, logger, request_plan(
+            "LXC EXEC",
+            endpoint,
+            {"command": command, "user": user, "console": bool(getattr(args, "console", False))},
+            {
+                "node": node,
+                "vmid": vmid,
+                "command": command,
+                "transports": ["ssh"] + (["termproxy"] if getattr(args, "console", False) else []),
+                "console_note": "termproxy is opt-in only; pass --console to allow the shared-pty fallback",
+            },
+        ))
 
     # 1. If password is provided or SSH key exists, attempt SSH first (quietly —
     # the fallback must emit exactly ONE final JSON document, otherwise chat.py
@@ -534,7 +545,24 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
                 }, args.format, title=f"LXC {vmid} Exec (ssh)")
             return EXIT_SUCCESS
 
-    # 2. Try execution via Proxmox termproxy WebSocket API
+    # 2. Console (termproxy) is opt-in only. The LXC console is a single shared
+    # pty: attaching can land on a human's live shell, and ProxBot cannot tell
+    # whose session it found. Without --console the operator has asserted that
+    # nobody else holds it, so we never attach implicitly.
+    if not getattr(args, "console", False):
+        emit_output({
+            "ok": False,
+            "status": "console_not_requested",
+            "data": {"vmid": vmid, "node": node, "transport": "none"},
+            "error": (
+                f"No usable exec transport for container {vmid} on {node}. SSH into the guest was "
+                f"unavailable, and the console is opt-in because it is a single shared pty that may "
+                f"belong to someone else. Re-run with --console if you have confirmed nobody else is "
+                f"attached, or use `pct exec {vmid} -- <cmd>` from the node."
+            ),
+        }, args.format, title=f"LXC {vmid} Exec (console_not_requested)")
+        return EXIT_INTERNAL
+
     term_res = lxc_exec(node, vmid, command, timeout, config, client, logger, user=user, password=password, auto_inject_key=auto_inject_key, key_file=key_file)
     if term_res is not None:
         if term_res.get("status") in ("login_required", "login_failed", "console_unavailable", "output_lost"):
