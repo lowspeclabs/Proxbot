@@ -455,6 +455,32 @@ TOOLS_SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "lxc_pct_exec",
+            "description": (
+                "Run a shell command inside a running LXC container using the Proxmox node's "
+                "`pct exec`, over SSH to the node. This is the reliable out-of-band path: it needs "
+                "no login prompt, no console, and no guest networking, so prefer it when guest SSH "
+                "is unavailable. Supply only the container ID and the command. The node, the `pct` "
+                "invocation and the shell are chosen by the harness and cannot be overridden; "
+                "commands that are not exactly what the harness assembles are rejected. Prompts the "
+                "user for approval. Do not use this to reach the Proxmox node itself - use the API "
+                "tools for that."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node hosting the container. Defaults to the configured node."},
+                    "vmid": {"type": "integer", "description": "LXC container ID."},
+                    "command": {"type": "string", "description": "Shell command to run inside the container (e.g. 'systemctl status nginx', 'apt update')."},
+                    "timeout": {"type": "integer", "description": "Execution timeout in seconds (default: 30)."}
+                },
+                "required": ["vmid", "command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ssh_exec",
             "description": "Execute a shell command over SSH on a VM, LXC container, or remote host. Prompts user for approval.",
             "parameters": {
@@ -695,9 +721,15 @@ READ_ONLY_TOOLS = {
 WRITE_TOOLS = {
     "vm_create", "lxc_create", "vm_clone", "lxc_clone", "vm_start", "vm_shutdown", "vm_reboot",
     "vm_snapshot_create", "lxc_start", "lxc_shutdown", "lxc_reboot",
-    "lxc_snapshot_create", "storage_download", "templates_download", "vm_exec", "lxc_exec", "ssh_exec"
+    "lxc_snapshot_create", "storage_download", "templates_download", "vm_exec", "lxc_exec", "ssh_exec",
+    "lxc_pct_exec",
 }
 DESTRUCTIVE_TOOLS = {
     "vm_stop", "lxc_stop", "vm_delete", "lxc_delete",
     "vm_snapshot_delete", "lxc_snapshot_delete"
 }
+
+# Tools whose command is assembled and validated by the harness, not taken from
+# the model. `agent.py` refuses these before the approval prompt, so typing `y`
+# cannot wave through a command that is not exactly what the harness would build.
+HARNESS_ASSEMBLED_TOOLS = {"lxc_pct_exec"}

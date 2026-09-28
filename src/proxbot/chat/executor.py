@@ -6,6 +6,9 @@ import subprocess
 import sys
 from typing import Any, Dict, List
 
+from .spec import HARNESS_ASSEMBLED_TOOLS
+from .watchdog import validate_harness_command
+
 class ProxmoxToolExecutor:
     """Executes tools by invoking scripts/Proxmox-cli.py as a subprocess."""
 
@@ -261,6 +264,17 @@ class ProxmoxToolExecutor:
                 cmd.extend(["--request-timeout", str(args["timeout"])])
             return cmd
 
+        elif tool_name == "lxc_pct_exec":
+            # Harness-assembled. The model supplies vmid and command only; the
+            # node, the pct invocation and the shell are fixed here, and the
+            # watchdog has already refused anything that is not exactly this.
+            cmd = ["lxc", "pct-exec", "--vmid", str(vmid), "--command", str(args["command"]), "--execute"]
+            if node and node != "N/A":
+                cmd.extend(["--node", str(node)])
+            if args.get("timeout"):
+                cmd.extend(["--request-timeout", str(args["timeout"])])
+            return cmd
+
         # SSH Command Execution
         elif tool_name == "ssh_exec":
             cmd = ["ssh", "exec", "--command", str(args["command"]), "--execute"]
@@ -349,6 +363,15 @@ class ProxmoxToolExecutor:
 
     def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a tool command, automatically handling multi-node queries and auto-stop before delete."""
+        # Second enforcement layer. The watchdog in agent.py already refuses
+        # malformed harness-assembled calls, but the executor is also reachable
+        # directly (tests, the broker, any future caller), so the check is
+        # repeated here rather than assumed.
+        if tool_name in HARNESS_ASSEMBLED_TOOLS:
+            allowed, reason = validate_harness_command(tool_name, arguments)
+            if not allowed:
+                return {"ok": False, "error": reason, "command": None, "dry_run": False}
+
         # Multi-node aggregation for VMs and LXCs
         if tool_name in ("vms_list", "lxcs_list") and not arguments.get("node"):
             nodes = self._get_cluster_nodes()

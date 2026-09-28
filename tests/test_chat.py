@@ -166,6 +166,114 @@ class LoopWatchdogTests(unittest.TestCase):
         self.assertIn("Maximum tool executions per turn", reason)
 
 
+class HarnessCommandValidationTests(unittest.TestCase):
+    """The model may only ask for the command the harness would assemble itself."""
+
+    def _ok(self, args):
+        allowed, reason = chat.validate_harness_command("lxc_pct_exec", args)
+        self.assertTrue(allowed, reason)
+
+    def _refused(self, args, needle=None):
+        allowed, reason = chat.validate_harness_command("lxc_pct_exec", args)
+        self.assertFalse(allowed)
+        if needle:
+            self.assertIn(needle, reason)
+
+    # --- accepted shapes -------------------------------------------------
+    def test_accepts_minimal_call(self):
+        self._ok({"vmid": 170, "command": "systemctl status nginx"})
+
+    def test_accepts_node_and_timeout(self):
+        self._ok({"vmid": 170, "command": "id", "node": "pveheavy", "timeout": 60})
+
+    def test_accepts_numeric_string_vmid(self):
+        self._ok({"vmid": "170", "command": "id"})
+
+    # --- refused: attempts to steer the harness --------------------------
+    def test_refuses_injected_host(self):
+        self._refused({"vmid": 170, "command": "id", "host": "attacker.example"}, "does not accept host")
+
+    def test_refuses_injected_user(self):
+        self._refused({"vmid": 170, "command": "id", "user": "root"}, "does not accept user")
+
+    def test_refuses_arbitrary_shell(self):
+        self._refused({"vmid": 170, "command": "id", "shell": "/bin/bash"}, "does not accept shell")
+
+    def test_refuses_arbitrary_remote_argv(self):
+        self._refused({"vmid": 170, "command": "id", "remote": "rm -rf /"}, "does not accept remote")
+
+    def test_refuses_non_numeric_vmid(self):
+        self._refused({"vmid": "170; rm -rf /", "command": "id"}, "numeric vmid")
+
+    def test_refuses_boolean_vmid(self):
+        # bool is an int subclass; True must not become vmid 1.
+        self._refused({"vmid": True, "command": "id"}, "integer vmid")
+
+    def test_refuses_empty_command(self):
+        self._refused({"vmid": 170, "command": "   "}, "non-empty string command")
+
+    def test_refuses_non_string_command(self):
+        self._refused({"vmid": 170, "command": ["rm", "-rf", "/"]}, "non-empty string command")
+
+    def test_refuses_command_that_starts_with_pct(self):
+        # Guards against the model treating this as a node shell, which would
+        # otherwise surface as a confusing "command not found" in the guest.
+        self._refused({"vmid": 170, "command": "pct exec 200 -- id"}, "starts with `pct`")
+        self._refused({"vmid": 170, "command": "  /usr/sbin/pct status"}, "starts with `pct`")
+
+    def test_allows_pct_appearing_inside_a_real_command(self):
+        # Must not be a naive substring match: these are legitimate guest
+        # commands that merely mention pct.
+        self._ok({"vmid": 170, "command": "cat /etc/pct.conf 2>/dev/null"})
+        self._ok({"vmid": 170, "command": "ls /usr/bin | grep -c pct"})
+        self._ok({"vmid": 170, "command": "echo impacted; df -h"})
+
+    def test_ignores_other_tools(self):
+        allowed, _ = chat.validate_harness_command("ssh_exec", {"host": "10.0.0.5", "command": "id"})
+        self.assertTrue(allowed)
+
+    # --- enforcement actually happens in the watchdog --------------------
+    def test_watchdog_blocks_before_the_approval_prompt(self):
+        dog = chat.LoopWatchdog()
+        allowed, reason = dog.check_call("lxc_pct_exec", {"vmid": 170, "command": "id", "host": "x"})
+        self.assertFalse(allowed)
+        self.assertIn("does not accept", reason)
+        # Blocked calls must not consume the per-turn budget, so a rejected
+        # attempt cannot be used to exhaust the turn and mask a later one.
+        self.assertEqual(dog.total_calls_in_turn, 0)
+
+    def test_watchdog_allows_a_wellformed_call(self):
+        dog = chat.LoopWatchdog()
+        allowed, reason = dog.check_call("lxc_pct_exec", {"vmid": 170, "command": "id"})
+        self.assertTrue(allowed, reason)
+        self.assertEqual(dog.total_calls_in_turn, 1)
+
+    def test_executor_refuses_even_when_called_directly(self):
+        # Bypassing agent.py must not bypass validation.
+        executor = chat.ProxmoxToolExecutor(pathlib.Path("/nonexistent/cli.py"), pathlib.Path("/nonexistent/.env"))
+        result = executor.execute("lxc_pct_exec", {"vmid": 170, "command": "id", "host": "attacker"})
+        self.assertFalse(result["ok"])
+        self.assertIn("does not accept", result["error"])
+
+    def test_executor_builds_the_expected_argv(self):
+        executor = chat.ProxmoxToolExecutor(pathlib.Path("/nonexistent/cli.py"), pathlib.Path("/nonexistent/.env"))
+        argv = executor._build_cli_args("lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy", "timeout": 45})
+        self.assertEqual(argv, [
+            "lxc", "pct-exec", "--vmid", "170", "--command", "id",
+            "--execute", "--node", "pveheavy", "--request-timeout", "45",
+        ])
+        # The model cannot inject a shell or an extra flag into the argv.
+        self.assertNotIn("--host", argv)
+        self.assertNotIn("--shell", argv)
+
+    def test_tool_is_advertised_to_the_model(self):
+        from proxbot.chat import spec as spec_mod
+        names = {t["function"]["name"] for t in spec_mod.TOOLS_SPEC}
+        self.assertIn("lxc_pct_exec", names)
+        self.assertIn("lxc_pct_exec", chat.WRITE_TOOLS)
+        self.assertIn("lxc_pct_exec", chat.HARNESS_ASSEMBLED_TOOLS)
+
+
 class SafetyGateTests(unittest.TestCase):
     def test_read_only_tools_pass(self):
         gate = chat.SafetyGate(auto_approve=False)
