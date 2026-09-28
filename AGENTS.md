@@ -24,7 +24,12 @@ Maintain a safe CLI wrapper that allows an agent harness to inspect and manage P
 2. Check `.env.example` but never print or expose real `.env` secrets.
 3. Inspect `scripts/BUGS.md`.
 4. Inspect `scripts/IMPROVEMENTS.md`.
-5. Run read-only checks before any write command.
+5. Run `git status --short` — if the tree is dirty, stop and ask before editing.
+6. Confirm secrets are ignored: `git check-ignore -q .env && echo safe`.
+7. Run read-only checks before any write command.
+
+Everything you change must end up on a branch and in a commit. See **Git
+Workflow** below before the first edit.
 
 ## Setup
 
@@ -46,7 +51,8 @@ PROXMOX_API_TOKEN_ID=agent@pve!opencode
 PROXMOX_API_TOKEN_SECRET=replace-me
 ```
 
-Never commit `.env`.
+Never commit `.env`. The full git rules — branching, staging, commit format, and
+recovery — are in **Git Workflow** below and are mandatory for any code change.
 
 ## Common Read-Only Commands
 
@@ -349,18 +355,151 @@ Use this format:
 - Related files:
 ```
 
+## Git Workflow
+
+This repository is under version control (branch `main`, baseline commit created
+2026-09-28). Treat git as the primary safety mechanism for every code change.
+
+### Non-negotiable rules
+
+1. **Never commit secrets.** `.env`, `.lxc-ssh-key-*`, `logs/`, `.agent/`, and
+   `.chat_history` are gitignored. Before the first commit of any session, verify:
+   ```bash
+   git check-ignore -q .env && echo "safe"
+   ```
+   If you ever add a new file that holds a token, password, or private key, add it
+   to `.gitignore` **before** staging.
+2. **Never rewrite published history.** No `git push --force`, no `git rebase` on
+   a shared branch, no `git checkout --orphan` rewrites, no skipping hooks.
+3. **Never commit code you cannot get back.** The one unrecoverable loss in this
+   project's history was overwriting a file with no backup and no commit. Commit
+   *before* any large move, rename, or refactor — not after.
+4. **Never `git add -A` blindly.** Stage explicit paths and read the diff:
+   ```bash
+   git status --short
+   git diff --cached
+   ```
+
+### Starting a change (feature or bug fix)
+
+```bash
+# 1. Confirm a clean starting point. If anything is dirty, stop and ask.
+git status --short          # must be empty
+git log --oneline -3
+
+# 2. Branch. One branch per logical change.
+git checkout -b fix/short-slug      # or: feat/short-slug, docs/short-slug
+
+# 3. For anything beyond a small edit, checkpoint the pre-change state first so a
+#    bad refactor is recoverable with `git checkout main`:
+git tag pre-refactor-YYYYMMDD      # optional but cheap
+```
+
+### While working
+
+- Make the smallest change that solves the problem. One concern per commit.
+- If a change touches `src/proxbot/`, keep the old import path working: the
+  entrypoints (`chat.py`, `scripts/Proxmox-cli.py`, `scripts/Proxmox-console.py`)
+  are re-export shims, and tests plus the console broker load them by path.
+- After moving code between modules, run the static reference check:
+  ```bash
+  python3 tests/check_undefined_names.py src/proxbot
+  ```
+  (`src/proxbot/cli/main.py` is expected to appear: it binds handlers
+  dynamically from the registry.)
+
+### Before committing
+
+```bash
+# 1. Full test suite must pass.
+python3 -m unittest discover -s tests
+
+# 2. Static checks.
+python3 tests/check_undefined_names.py src/proxbot
+python3 tests/verify_cli_equivalence.py    # see caveat below
+
+# 3. For CLI changes, confirm the machine-readable surface is unchanged.
+python3 scripts/Proxmox-cli.py --format json commands --no-log
+
+# 4. Exercise at least one read-only command against the live API.
+python3 scripts/Proxmox-cli.py --format json nodes list
+
+# 5. Update scripts/BUGS.md and/or scripts/IMPROVEMENTS.md in the SAME commit.
+
+# 6. Stage deliberately and read what you staged.
+git add <explicit paths>
+git diff --cached
+git diff --cached | grep -nEi "PVEAPIToken=|PRIVATE KEY|api_token_secret"
+#    → must show only placeholders such as replace-me / USER@REALM!TOKENID
+```
+
+> Caveat: `tests/verify_cli_equivalence.py` compares the refactored CLI against a
+> pre-refactor baseline at `/tmp/opencode/Proxmox-cli.py.orig`. That path is
+> temporary and will disappear on reboot; the script then exits `2` and skips the
+> check. If that happens, restore the baseline into the repo (e.g.
+> `tests/baselines/Proxmox-cli.pre-refactor.py`) and update the constant at the
+> top of the script.
+
+### Committing
+
+Commit messages in this repo use a short summary line, an optional body, and a
+`Fixes:`/`Feature:` style breakdown. Match that style. Reference the tracked
+files you touched.
+
+```bash
+git commit -F - <<'EOF'
+Add lxc clone / vm clone for converted templates
+
+Converted templates (template:1) cannot be built with `lxc create
+--ostemplate`; that path failed with a misleading "Only root can pass
+arbitrary filesystem paths". Wraps the clone endpoint instead.
+
+Fixes:
+  - lxc create validates --ostemplate against <storage>:vztmpl/*.tar.*
+  - templates_list tags each entry with its creation_method
+
+Verification:
+  - 89 unittests pass
+  - `commands --format json` unchanged
+EOF
+```
+
+### After committing
+
+```bash
+git log --oneline -3
+git status --short          # must be empty
+```
+
+Report to the user: what changed, why, how it was verified, and any residual risk.
+If a change required reconstructing or guessing prior behavior, say so explicitly
+rather than presenting it as a clean fix.
+
+### Recovering
+
+```bash
+git diff                        # review uncommitted changes
+git restore <path>              # discard changes to a file
+git restore --staged <path>     # unstage
+git switch -                    # back to previous branch
+git revert <sha>                # undo a committed change with a new commit
+git reset --hard <sha>          # DESTRUCTIVE: only on an unpushed local branch
+```
+
 ## Before Changing Code
 
 - Check existing bugs and improvements.
-- Prefer small, testable changes.
+- Confirm `git status --short` is empty; branch before editing.
+- Prefer small, testable changes, one commit per concern.
 - Preserve safety defaults.
 - Do not add new dependencies unless they clearly reduce complexity.
 
 ## After Changing Code
 
-- Run the safest available tests.
+- Run the full test suite: `python3 -m unittest discover -s tests`.
 - Run `doctor` if a live `.env` is available.
 - Test at least one read-only command.
 - Confirm logs are created and secrets are redacted.
 - Update `scripts/BUGS.md` or `scripts/IMPROVEMENTS.md` when appropriate.
+- Commit with an explicit path list, then confirm `git status --short` is empty.
 - Summarize what changed and why.
