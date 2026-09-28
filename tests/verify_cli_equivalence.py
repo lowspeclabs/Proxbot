@@ -22,6 +22,10 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 #   template, for building a keyed base image that clones inherit.
 # _redact_command_str: now delegates to the shared secret-flag pattern so the
 #   argv and joined-string forms cannot drift apart.
+# _run_ssh_command: adds LogLevel=ERROR so the "Permanently added ..."
+#   notice stops firing on every connection (UserKnownHostsFile=/dev/null
+#   means the host key is never remembered, so the notice carries no
+#   information).
 # cmd_ssh_exec: refuses Proxmox node targets so the pct exec allowlist
 #   cannot be bypassed with a generic SSH call.
 # cmd_pct_exec and its helpers are new, so they have no baseline to differ from.
@@ -36,6 +40,7 @@ KNOWN_CHANGES = {
     "lxc_exec",
     "main",
     "_redact_command_str",
+    "_run_ssh_command",
     "Config",
     "Config.__init__",
 }
