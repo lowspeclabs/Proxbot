@@ -1,0 +1,38 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated SSH keys (lxc create --ssh-keygen writes these into the repo root)
+.lxc-ssh-key-*
+.lxc-ssh-key-*.pub
+
+# Logs (may contain command output, hostnames, IPs, and session transcripts)
+scripts/logs/*.jsonl
+scripts/logs/latest.jsonl
+scripts/logs/console-sessions/
+logs/
+
+# Agent scratch state
+.agent/
+
+# Local chat REPL history (contains operator prompts)
+.chat_history
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
