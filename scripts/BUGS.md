@@ -355,3 +355,14 @@ Known open issues are listed below.
 - Suspected cause: Auth-failure string was returned as a generic error with no `ssh_auth_failed` status and no getpass prompt path.
 - Fix notes: `ChatAgent` now detects `Permission denied (publickey…)` / auth-failure patterns (including nested `data.stderr`), prompts for SSH user (default prior user), key file (`none` to clear), and password via getpass, retries once with updated creds, else returns `status=ssh_auth_failed` with an explicit do-not-retry instruction. Added `--password` to `ssh exec` parser + executor forwarding (redacted via existing `--password` rules; session logs redact `password`/`key` substrings). Updated `ssh_exec` spec + system prompt to forbid blind retries.
 - Related log file: N/A (transcript in report)
+
+## 2026-09-28 — `/doctor` crashed with `NameError: json is not defined`
+
+- Status: fixed
+- Found by: human
+- Command: `./chat.py` → `/doctor`
+- Expected: Cluster health JSON rendered as Markdown.
+- Actual: `NameError: name 'json' is not defined` — the `chat.py` composition-root shim uses `json.dumps` in its `/doctor`, `/nodes`, `/vms`, `/lxcs`, `/templates`, and `/registry` handlers but never imported `json`.
+- Suspected cause: Refactor moved the implementation into `src/proxbot/` while `main()` stayed in the shim; the import did not move with it.
+- Fix notes: Added `import json` to `chat.py`. Verified: shim compiles, `--help` works, `/doctor` and `/nodes` render paths produce output, 169 unittests pass. Note: `chat.py: error: unrecognized arguments: --console` is expected — `--console` is a `Proxmox-cli.py lxc exec` flag, not a `chat.py` flag.
+- Related log file: scripts/logs/chat-sessions/chat-20260928-184525-0f0379.jsonl

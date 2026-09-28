@@ -11,6 +11,7 @@ tests (`import chat`), and the approval/REPL loop keep working unchanged.
 """
 
 import argparse
+import json
 import pathlib
 import sys
 from typing import Any, Dict, List, Optional, Tuple
