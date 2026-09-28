@@ -334,3 +334,19 @@ Track proposed improvements while developing or using `scripts/Proxmox-cli.py`.
 - Follow-up: Add optional image-diff/cursor detection between before/after screenshots and report `cursor_moved_detected: true|false|unknown`.
 - Tradeoffs: Cursor detection is not implemented yet because it can be unreliable across themes and hidden cursors; the new sequential test and per-step screenshots remove the most immediate ambiguity.
 - Related files: `scripts/Proxmox-console.py`, `tests/test_console.py`, `AGENTS.md`
+
+## 2026-09-28 — Separate exec transports from console attachment, and confine node access
+
+- Status: implemented
+- Area: cli | safety | docs | tests
+- Reason: `lxc exec` conflated two different things. Guest SSH and node-side `pct exec` are execution mechanisms; termproxy is a terminal *attachment* mechanism with no ownership boundary. A single shared pty cannot be driven by an agent safely: measured on pveheavy/170, the prompt appeared on 2 of ~20 attachments and never echoed input, so an agent that attaches may be typing into a human's live shell and parsing their screen as output. Separately, the Proxmox REST API has no exec endpoint for LXC, so the only sound out-of-band path is `pct exec` on the node — which is a far more valuable target than a guest and needed its own guard.
+- Suggested change:
+  - Split the transport decision: SSH first, `pct exec` second, console only on explicit `--console`.
+  - Added `lxc pct-exec`, with the remote command assembled in exactly one place as `pct exec <vmid> -- /bin/sh -lc <command>` and shlex-quoted, so callers cannot influence the node, the `pct` invocation, or the shell.
+  - Added `doctor --node-access`, which probes each node with `pct version` and reports whether `pct exec` is actually usable, with the reason when not. `doctor` now always reports which of the three transports are available.
+  - Added `validate_harness_command()`, called from `LoopWatchdog.check_call()` — which runs *before* the approval prompt, so it cannot be satisfied by typing `y` or by auto-approve. It refuses rather than sanitises, and is repeated in the executor because that is reachable directly.
+  - `cmd_ssh_exec` now refuses Proxmox node targets, closing the route around the `pct exec` allowlist.
+  - `lxc create --as-template` closes the template-authoring gap that left clones with no way in.
+- Tradeoffs: Containers with no guest SSH and no node access are now unreachable to the agent, where previously the console would be tried and would usually type into someone's session. That is the intended trade: an honest refusal beats an unreliable and unsafe one. Node SSH also means ProxBot can hold root on a hypervisor, which is why it is off by default and separately gated.
+- Follow-up: `PROXMOX_NODE_SSH_TARGETS` is currently all-or-nothing per target. Consider scoping it per command class, and consider an allowlist of `pct` subcommands rather than only subcommand-prefix checks.
+- Related files: `src/proxbot/cli/commands/nodessh.py`, `src/proxbot/cli/commands/exec.py`, `src/proxbot/chat/watchdog.py`, `src/proxbot/chat/executor.py`, `src/proxbot/chat/spec.py`, `.env.example`, `tests/test_cli.py`, `tests/test_chat.py`

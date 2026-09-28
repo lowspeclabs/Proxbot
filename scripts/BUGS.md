@@ -21,6 +21,50 @@ Track bugs discovered while developing or using `scripts/Proxmox-cli.py`.
 
 Known open issues are listed below.
 
+### 2026-09-28 — `ssh exec` let the model reach a Proxmox node, bypassing every exec allowlist
+
+- Status: fixed
+- Found by: agent
+- Command: `ssh exec --host pveheavy --command "<anything>" --execute` (reachable from the model as the `ssh_exec` tool)
+- Expected: The model cannot obtain a host shell on a hypervisor node.
+- Actual: `ssh_exec` is a generic tool with a `host` parameter, so the model could aim SSH at a cluster node and run any command. Under `CHAT_AUTO_APPROVE=true` there was no prompt at all. This made the `pct exec` allowlist decorative — the model could route straight around it with a plain SSH call.
+- Suspected cause: No distinction was drawn between a guest target and a hypervisor target. The tool predates any notion of node access being privileged.
+- Fix notes: `cmd_ssh_exec` now refuses a target that resolves to a cluster node, matched against node names, their API-resolved addresses, and the configured default node. Matching is case-insensitive and covers FQDN forms (`pveheavy.lan`, `192.168.1.65.lan`), which would otherwise bypass an equality check. Refusal returns `node_target_refused` with `EXIT_SAFETY` and names `lxc pct-exec` as the sanctioned path. Targets listed in `PROXMOX_NODE_SSH_TARGETS` are never blocked; guests are unaffected.
+- Related log file: N/A
+
+### 2026-09-28 — Console output loss was reported as a successful command
+
+- Status: fixed
+- Found by: agent
+- Command: Any `lxc exec` that reached the termproxy fallback
+- Expected: An unverifiable result is reported as unknown.
+- Actual: Two fail-open paths. If the trailing `:$?` was not captured, `exit_code` silently defaulted to `0`, telling the agent a failed command had succeeded. If a boundary marker was missing, the function returned `None`, reported as "Could not establish a termproxy console session" — false, since the session had worked and only the result was unreadable.
+- Suspected cause: Fail-open defaults in the output parser, and overloading `None` for both "transport never came up" and "transport worked, result lost".
+- Fix notes: New `_parse_console_output()` reports `output_lost` with `exit_code: null` when the start marker, end marker, or exit status is missing, keeping partial output in `observed`. The exit status is matched anchored to the marker, so trailing scrollback such as `prompt:12` cannot be misread as the exit code. `output_lost` is distinct from `console_unavailable`, and the transport-failure message no longer asserts a session problem it cannot know about.
+- Related log file: N/A
+
+### 2026-09-28 — termproxy was an automatic exec fallback onto a shared pty
+
+- Status: fixed
+- Found by: agent
+- Command: `lxc exec` when guest SSH was unavailable, before `--console` existed
+- Expected: The agent does not attach to a terminal it may not own.
+- Actual: When SSH failed, `lxc exec` attached to the container console without asking. The LXC console is a single shared pty, so the attach can land on a human's live shell: ProxBot would type into it, append its SSH public key to that account, and hand the terminal's scrollback to the model as "command output". The prompt test is a generic `#`/`$` terminator, so it cannot tell whose session it found.
+- Suspected cause: The console was treated as a transport rather than as a shared interactive resource. Measured on pveheavy/170: the prompt appeared on only 2 of ~20 attachments, and on 0 of 13 with no other session holding the console.
+- Fix notes: `--console` is now required. Without it, `lxc exec` tries SSH and then returns `console_not_requested`, naming `--console` and `pct exec` as the alternatives. An absent `console` attribute means "not requested", so older `Namespace` callers cannot silently re-enable it. The dry-run plan lists the transports that will actually be used and is labelled `LXC EXEC` rather than `TERMPROXY`, since SSH is the primary path.
+- Related log file: N/A
+
+### 2026-09-28 — `lxc clone` has no `--ssh-public-keys`, so clones come up unreachable
+
+- Status: fixed
+- Found by: agent
+- Command: `lxc clone --node pveheavy --vmid 20300 --new-vmid 170 --execute`
+- Expected: A clone of a template with a baked-in SSH key arrives reachable.
+- Actual: Clones of template 20300 had no way in: no SSH key, no console login (see the getty entry below), and an address that collided with another node. `lxc create` supports `--ssh-public-keys`/`--ssh-keygen`, but `lxc clone` exposes only `--hostname --storage --pool --snapname`, so a key can only be baked in at create time.
+- Suspected cause: Template authoring had no supported path — converting a container to a template was reachable only through the raw API.
+- Fix notes: `lxc create --as-template` converts the new container after creation and prints the clone command to use it. The dry-run plan shows the follow-up `POST /nodes/{node}/lxc/<vmid>/template` call. With a stock `debian-13-standard` tarball this yields a base template whose clones arrive with working guest SSH, needing neither a console login nor node-side `pct exec`.
+- Related log file: N/A
+
 ### 2026-09-28 — LXC console exec reports "incorrect password" without ever testing a credential
 
 - Status: fixed
