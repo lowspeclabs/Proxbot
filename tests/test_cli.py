@@ -784,6 +784,91 @@ class PctExecTests(unittest.TestCase):
         self.assertFalse(data["node_ssh"]["configured"])
 
 
+class NodeTargetGuardTests(unittest.TestCase):
+    """`ssh exec` must not double as a host shell that bypasses pct exec."""
+
+    def _config(self, **extra):
+        raw = {
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        }
+        raw.update(extra)
+        return cli.Config(raw)
+
+    class Client:
+        def get(self, endpoint):
+            if endpoint == "/nodes":
+                return {"ok": True, "data": [{"node": "pveheavy"}, {"node": "pvestore"}]}
+            if endpoint.endswith("/network"):
+                return {"ok": True, "data": [
+                    {"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"},
+                ]}
+            return {"ok": True, "data": {}}
+
+    def _refused(self, host, config=None, client=None):
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH to a Proxmox node")
+
+        args = argparse.Namespace(host=host, node=None, vmid=None, command="id", user="root",
+                                  password=None, port=22, key_file=None, timeout=10,
+                                  no_auto_inject_key=True, execute=True, format="json")
+        out = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = cli.cmd_ssh_exec(args, config or self._config(), client or self.Client(),
+                                        cli.Logger(None, no_log=True))
+        return code, out.getvalue()
+
+    def test_refuses_node_name(self):
+        code, out = self._refused("pveheavy")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+        self.assertEqual(json.loads(out)["status"], "node_target_refused")
+
+    def test_refuses_node_name_case_insensitively(self):
+        code, _ = self._refused("PVEHEAVY")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_refuses_node_address(self):
+        code, _ = self._refused("10.0.0.1")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_refuses_node_address_with_domain_suffix(self):
+        # Guards against the FQDN bypass: 10.0.0.1.lan must not slip through.
+        code, _ = self._refused("10.0.0.1.lan")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_refuses_node_name_with_domain_suffix(self):
+        code, _ = self._refused("pveheavy.example.net")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_allows_explicitly_listed_target(self):
+        config = self._config(PROXMOX_NODE_SSH_TARGETS="pveheavy,10.0.0.1")
+        def _fake(**_kwargs):
+            return (0, "ok\n", "")
+        args = argparse.Namespace(host="pveheavy", node=None, vmid=None, command="id", user="root",
+                                  password=None, port=22, key_file=None, timeout=10,
+                                  no_auto_inject_key=True, execute=True, format="json")
+        out = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(out):
+                code = cli.cmd_ssh_exec(args, config, self.Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_SUCCESS)
+
+    def test_does_not_block_a_guest(self):
+        def _fake(**_kwargs):
+            return (0, "guest ok\n", "")
+        args = argparse.Namespace(host="10.0.0.99", node=None, vmid=None, command="id", user="root",
+                                  password=None, port=22, key_file=None, timeout=10,
+                                  no_auto_inject_key=True, execute=True, format="json")
+        out = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(out):
+                code = cli.cmd_ssh_exec(args, self._config(), self.Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_SUCCESS)
+        self.assertIn("guest ok", out.getvalue())
+
+
 class TemplateRegistryTests(unittest.TestCase):
     def test_registry_parser_args(self):
         args = cli.build_parser().parse_args([

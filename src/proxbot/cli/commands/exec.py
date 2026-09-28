@@ -670,6 +670,58 @@ def _resolve_guest_ip(node: str, vmid: str, kind: str | None, client: ProxmoxCli
     return None
 
 
+def _node_addresses_for_target(client: ProxmoxClient | None) -> dict[str, str]:
+    """node name -> IPv4 address, reusing the pct exec transport's resolution."""
+    from .nodessh import _node_addresses
+
+    try:
+        return _node_addresses(client)
+    except Exception:
+        return {}
+
+
+def _blocked_node_target(
+    host: str,
+    node: str | None,
+    config: Config,
+    client: ProxmoxClient | None,
+) -> str | None:
+    """Return the matched node name if `host` is a Proxmox node, else None.
+
+    Matches on cluster node names, their resolved addresses, and the configured
+    default node. An explicitly allowed target is never blocked.
+    """
+    target = str(host).strip().lower()
+    if not target:
+        return None
+
+    allowed = {str(item).strip().lower() for item in config.node_ssh_targets}
+    if target in allowed:
+        return None
+
+    candidates: dict[str, str] = {}
+    if node:
+        candidates[str(node).strip().lower()] = str(node)
+    for name, address in _node_addresses_for_target(client).items():
+        candidates[name.strip().lower()] = name
+        candidates[address.strip().lower()] = name
+    if config.default_node:
+        candidates[str(config.default_node).strip().lower()] = str(config.default_node)
+
+    if target in candidates:
+        return candidates[target]
+
+    # A node name may also be reachable as a bare or FQDN form; compare the
+    # short label and any address followed by a domain suffix.
+    short = target.split(".")[0]
+    if short in candidates:
+        return candidates[short]
+    for name, address in _node_addresses_for_target(client).items():
+        if address and target.startswith(address + "."):
+            return name
+    return None
+
+
 def cmd_ssh_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient, logger: Logger, emit: bool = True) -> int:
     """Execute SSH command. When emit=False (internal fallback from lxc exec),
     stay silent so the caller can emit a single final JSON document."""
@@ -695,6 +747,27 @@ def cmd_ssh_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
     if not command:
         _emit_err("validation", "--command is required", "Provide a non-empty shell command to execute.")
         return EXIT_VALIDATION
+
+    # A Proxmox node is root on the hypervisor. `ssh exec` is a generic tool, so
+    # without this guard the model can route around the pct exec allowlist by
+    # aiming a plain SSH call at a node. Node targets must be named explicitly.
+    if host:
+        blocked = _blocked_node_target(host, node, config, client)
+        if blocked is not None:
+            _emit({
+                "ok": False,
+                "status": "node_target_refused",
+                "data": {"host": host, "node": node, "allowed": config.node_ssh_targets},
+                "error": (
+                    f"Refusing to SSH to {host!r}: it looks like a Proxmox node. `ssh exec` is a "
+                    f"generic tool and must not be usable as a host shell, or the pct exec "
+                    f"allowlist can be bypassed. To reach a container out-of-band use "
+                    f"`lxc pct-exec --vmid <id> --command <cmd>`, which the harness assembles and "
+                    f"validates. To permit direct node SSH, list the target in "
+                    f"PROXMOX_NODE_SSH_TARGETS."
+                ),
+            }, "SSH Exec")
+            return EXIT_SAFETY
 
     # Resolve IP from VM or LXC if --host not explicitly provided
     if not host:
