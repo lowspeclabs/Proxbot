@@ -152,6 +152,8 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_lxc_ssh_keygen(args, config, client, logger)
             if action == "exec":
                 return cmd_lxc_exec(args, config, client, logger)
+            if action == "pct-exec":
+                return cmd_pct_exec(args, config, client, logger)
             if action == "snapshot":
                 snap_action = getattr(args, "snapshot_action", None)
                 if snap_action == "list":

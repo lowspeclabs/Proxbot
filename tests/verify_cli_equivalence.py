@@ -16,7 +16,20 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 #   console_unavailable instead of guessing login_failed/login_required, and
 #   credential rejection is distinguished from a post-login timeout.
 # build_parser: `lxc exec` gained --console, so the termproxy fallback is opt-in.
-KNOWN_CHANGES = {"cmd_vm_exec", "lxc_exec", "cmd_lxc_exec", "build_parser"}
+# Config/Config.__init__/cmd_doctor/main: node SSH settings and the
+#   doctor --node-access probe, plus the `lxc pct-exec` dispatch branch.
+# cmd_pct_exec and its helpers are new, so they have no baseline to differ from.
+KNOWN_CHANGES = {
+    "build_parser",
+    "cmd_doctor",
+    "cmd_lxc_exec",
+    "cmd_pct_exec",
+    "cmd_vm_exec",
+    "lxc_exec",
+    "main",
+    "Config",
+    "Config.__init__",
+}
 
 ORIG = pathlib.Path("/tmp/opencode/Proxmox-cli.py.orig")
 # Only the CLI-side modules correspond to the original CLI script. The chat and

@@ -5,12 +5,13 @@ tests patched them via ``cli.<name>``. To preserve that contract, handlers are
 imported here and re-exported from :mod:`proxmox.cli`.
 """
 
-from .commands import cluster, exec as guest_exec, lxc, storage, tasks, vm  # noqa: F401
+from .commands import cluster, exec as guest_exec, lxc, nodessh, storage, tasks, vm  # noqa: F401
 
 _HANDLERS = (
     cluster,
     guest_exec,
     lxc,
+    nodessh,
     storage,
     tasks,
     vm,
@@ -47,6 +48,8 @@ _SUPPORT = {
         "_run_ssh_command",
         "_parse_console_output",
         "lxc_exec",
+        "assemble_pct_exec",
+        "probe_node_ssh",
         "filter_registry_rows",
         "filter_rows",
     }

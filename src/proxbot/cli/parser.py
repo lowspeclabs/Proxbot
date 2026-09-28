@@ -110,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--kind", choices=["vm", "lxc"], help="Expected resource type")
     doctor = _cmd(sub.add_parser("doctor", help="Check config and API connectivity"))
     doctor.add_argument("--live", action="store_true", help="Run a live API connectivity test")
+    doctor.add_argument("--node-access", action="store_true", help="Also probe node SSH and report whether pct exec is usable (implies a live check)")
     _cmd(sub.add_parser("health", help="Show Proxmox health summary"))
 
     # Nodes
@@ -219,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_exec.add_argument("--no-auto-inject-key", action="store_true", help="Do not automatically inject SSH key after console login")
     lxc_exec.add_argument("--console", action="store_true", help="Allow fallback to the container console (termproxy). The console is a single shared pty, so only pass this when you have confirmed no other session is attached.")
     lxc_delete = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("delete", help="Delete LXC (requires --execute --force --confirm)")), destructive=True)
+    lxc_pct_exec = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("pct-exec", help="Run a command inside an LXC via the node (pct exec over SSH; requires --execute)")))
+    lxc_pct_exec.add_argument("--command", required=True, help="Shell command to run inside the container")
     lxc_fix_console = _cmd(_add_node_vmid_args(lxc_sub.add_parser("fix-console", help="Print Debian 13 LXC console workaround")))
     lxc_fix_console.add_argument("--ostemplate", help="OS template (if not stored in config)")
 

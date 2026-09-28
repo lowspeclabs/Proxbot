@@ -663,6 +663,127 @@ class ConsoleOutputParsingTests(unittest.TestCase):
         self.assertIsNone(result["data"]["exit_code"])
 
 
+class PctExecTests(unittest.TestCase):
+    """The pct exec transport: harness-assembled argv, no general node shell."""
+
+    def _config(self, **extra):
+        raw = {
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        }
+        raw.update(extra)
+        return cli.Config(raw)
+
+    def test_assemble_quotes_vmid_and_command(self):
+        self.assertEqual(
+            cli.assemble_pct_exec("170", "id"),
+            "pct exec 170 -- /bin/sh -lc id",
+        )
+
+    def test_assemble_neutralises_shell_metacharacters_in_command(self):
+        remote = cli.assemble_pct_exec("170", 'id; touch /tmp/pwned')
+        # The whole command must be a single quoted argument, so the node shell
+        # cannot split it into a second command.
+        self.assertEqual(remote, "pct exec 170 -- /bin/sh -lc 'id; touch /tmp/pwned'")
+        self.assertEqual(remote.count("'"), 2)
+
+    def test_refuses_non_numeric_vmid_before_any_ssh(self):
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH with an unvalidated vmid")
+
+        args = argparse.Namespace(node="pve", vmid="170; rm -rf /", command="id", timeout=30,
+                                  execute=True, format="json")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_VALIDATION)
+
+    def test_refuses_when_node_ssh_unconfigured(self):
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH when node access is unconfigured")
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", timeout=30,
+                                  execute=True, format="json")
+        stderr = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_VALIDATION)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "node_ssh_unconfigured")
+        self.assertIn("PROXMOX_NODE_SSH_USER", result["error"])
+
+    def test_runs_assembled_command_and_returns_real_exit_code(self):
+        seen = {}
+
+        def _fake_ssh(**kwargs):
+            seen.update(kwargs)
+            return (7, "partial output\n", "command not found\n")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint == "/nodes/pve/network":
+                    return {"ok": True, "data": [
+                        {"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"},
+                        {"iface": "eno1", "type": "eth", "cidr": None},
+                    ]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="nonexistent-binary", timeout=30,
+                                  execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root",
+                              PROXMOX_NODE_SSH_KEY="/keys/node")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake_ssh):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+
+        # Prefers the bridge address, assembles the remote command itself, and
+        # does not turn a failing command into a success.
+        self.assertEqual(seen["host"], "10.0.0.1")
+        self.assertEqual(seen["user"], "root")
+        self.assertEqual(seen["command"], "pct exec 170 -- /bin/sh -lc nonexistent-binary")
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stdout.getvalue() or stderr.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["exit_code"], 7)
+        self.assertEqual(result["data"]["transport"], "pct_exec")
+
+    def test_dry_run_by_default_shows_the_remote_command(self):
+        args = argparse.Namespace(node="pve", vmid=170, command="id", timeout=30,
+                                  execute=False, format="json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["data"]["target"]["remote"], "pct exec 170 -- /bin/sh -lc id")
+
+    def test_probe_reports_unconfigured_without_ssh(self):
+        def _explode(*_a, **_k):
+            raise AssertionError("probe must not SSH when unconfigured")
+
+        report = {}
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            report = cli.probe_node_ssh("pve", self._config(), None)
+        self.assertFalse(report["usable"])
+        self.assertFalse(report["configured"])
+        self.assertIn("PROXMOX_NODE_SSH_KEY", report["missing"])
+
+    def test_doctor_reports_transport_availability(self):
+        args = argparse.Namespace(live=False, node_access=False, node=None, format="json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cli.cmd_doctor(args, self._config(), None, cli.Logger(None, no_log=True))
+        data = json.loads(stdout.getvalue())["data"]
+        self.assertIn("pct_exec", data["exec_transports"])
+        self.assertIn("opt-in", data["exec_transports"]["console"])
+        self.assertFalse(data["node_ssh"]["configured"])
+
+
 class TemplateRegistryTests(unittest.TestCase):
     def test_registry_parser_args(self):
         args = cli.build_parser().parse_args([
