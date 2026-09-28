@@ -482,7 +482,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "ssh_exec",
-            "description": "Execute a shell command over SSH on a VM, LXC container, or remote host. Prompts user for approval.",
+            "description": "Execute a shell command over SSH on a VM, LXC container, or remote host. Prompts user for approval. On authentication failure the harness stops and asks the operator for a corrected user/key-file/password instead of retrying — do NOT retry the same credentials.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -494,6 +494,7 @@ TOOLS_SPEC = [
                     "user": {"type": "string", "description": "SSH username (default: root)."},
                     "port": {"type": "integer", "description": "SSH port (default: 22)."},
                     "key_file": {"type": "string", "description": "Path to SSH private key file (optional)."},
+                    "password": {"type": "string", "description": "SSH password (optional; prefer key auth. The harness prompts securely on auth failure — never ask the user to paste it into chat)."},
                     "timeout": {"type": "integer", "description": "Execution timeout in seconds (default: 30)."}
                 },
                 "required": ["command"],

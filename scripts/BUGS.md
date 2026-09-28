@@ -344,3 +344,14 @@ Known open issues are listed below.
 - Suspected cause: Undefined constant; the intended alias was `EXIT_API`.
 - Fix notes: Replaced all 3 uses with `EXIT_API`.
 - Related log file: N/A
+
+## 2026-09-28 — `ssh_exec` auth failure looped instead of asking for credentials
+
+- Status: fixed
+- Found by: human
+- Command: `chat.py` → "try to access container 170's shell" → `lxc_exec` (console_not_requested) → `lxc_pct_exec` (node SSH unconfigured) → `ssh_exec root@192.168.1.164` × 2 → `Permission denied (publickey,password)` twice, user interrupted
+- Expected: On publickey/password denial the harness stops and asks the operator for a corrected username, key file, or password instead of retrying identical credentials.
+- Actual: `ssh_exec` had no auth-failure escalation (unlike `lxc_exec` login_required and `lxc_pct_exec` node_password_required), and the CLI/executor had no `--password` plumbing for `ssh exec`, so the model retried the same failing root login in a loop (watchdog allows 2 duplicates).
+- Suspected cause: Auth-failure string was returned as a generic error with no `ssh_auth_failed` status and no getpass prompt path.
+- Fix notes: `ChatAgent` now detects `Permission denied (publickey…)` / auth-failure patterns (including nested `data.stderr`), prompts for SSH user (default prior user), key file (`none` to clear), and password via getpass, retries once with updated creds, else returns `status=ssh_auth_failed` with an explicit do-not-retry instruction. Added `--password` to `ssh exec` parser + executor forwarding (redacted via existing `--password` rules; session logs redact `password`/`key` substrings). Updated `ssh_exec` spec + system prompt to forbid blind retries.
+- Related log file: N/A (transcript in report)

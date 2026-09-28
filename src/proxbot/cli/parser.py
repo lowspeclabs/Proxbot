@@ -246,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     ssh_exec.add_argument("--user", default="root", help="SSH user (default: root)")
     ssh_exec.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     ssh_exec.add_argument("--key-file", "-i", help="Path to SSH private key")
+    ssh_exec.add_argument("--password", help="SSH password (prefer key auth; visible in process table, redacted in logs)")
 
     lxc_snapshot = lxc_sub.add_parser("snapshot", help="LXC snapshot commands")
     lxc_snapshot_sub = lxc_snapshot.add_subparsers(dest="snapshot_action", required=True)

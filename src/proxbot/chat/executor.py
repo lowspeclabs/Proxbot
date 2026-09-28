@@ -293,6 +293,8 @@ class ProxmoxToolExecutor:
                 cmd.extend(["--port", str(args["port"])])
             if args.get("key_file"):
                 cmd.extend(["--key-file", str(args["key_file"])])
+            if args.get("password"):
+                cmd.extend(["--password", str(args["password"])])
             if args.get("timeout"):
                 cmd.extend(["--request-timeout", str(args["timeout"])])
             return cmd
