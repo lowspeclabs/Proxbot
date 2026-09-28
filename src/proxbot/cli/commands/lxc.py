@@ -275,7 +275,10 @@ def cmd_lxc_create(args: argparse.Namespace, config: Config, client: ProxmoxClie
 
     guard = require_execute(args, endpoint)
     if guard is not None:
-        return emit_dry_run(args, logger, request_plan("POST", endpoint, body, {"node": node, "vmid": vmid}))
+        plan_target: dict[str, Any] = {"node": node, "vmid": vmid}
+        if getattr(args, "as_template", False):
+            plan_target["then"] = f"POST /nodes/{node}/lxc/{vmid}/template"
+        return emit_dry_run(args, logger, request_plan("POST", endpoint, body, plan_target))
 
     if ssh_keygen_flag:
         keygen_path = getattr(args, "ssh_key_path", None) or str(REPO_ROOT / f".lxc-ssh-key-{vmid}")
@@ -318,16 +321,55 @@ def cmd_lxc_create(args: argparse.Namespace, config: Config, client: ProxmoxClie
     )
     result = {"ok": resp["ok"], "data": resp.get("data"), "error": resp.get("error"), "task_id": task_id}
     emit_output(result, args.format, title=f"LXC {vmid} Create")
-    if resp["ok"] and task_id and getattr(args, "wait", False):
+
+    if not resp["ok"]:
+        return _exit_code_for(resp)
+
+    exit_code = EXIT_SUCCESS
+    if task_id and getattr(args, "wait", False):
         exit_code = _wait_for_task(node, task_id, args.wait_timeout, args, config, client, logger)
-        if exit_code == EXIT_SUCCESS and _is_debian_13_template(args.ostemplate):
-            print()
-            print(_lxc_console_fix_instructions(vmid))
-        return exit_code
-    if resp["ok"] and _is_debian_13_template(args.ostemplate):
+        if exit_code != EXIT_SUCCESS:
+            return exit_code
+
+    # Convert to a template. This is how a keyed base image is built: create with
+    # --ssh-public-keys/--ssh-keygen, then mark it so every future clone inherits
+    # the key. `lxc clone` has no --ssh-public-keys, so baking the key in here is
+    # the only way clones come up reachable.
+    if getattr(args, "as_template", False):
+        tpl_endpoint = f"/nodes/{node}/lxc/{vmid}/template"
+        tpl_resp = client.post(tpl_endpoint, {})
+        logger.log(
+            event="api_call",
+            argv=sys.argv[1:],
+            method="POST",
+            endpoint=tpl_endpoint,
+            status_code=tpl_resp.get("status_code"),
+            duration_ms=tpl_resp.get("duration_ms"),
+            ok=tpl_resp["ok"],
+            response_summary=f"node={node} vmid={vmid} action=template",
+            error=tpl_resp.get("error"),
+        )
+        emit_output(
+            {"ok": tpl_resp["ok"], "data": tpl_resp.get("data"), "error": tpl_resp.get("error")},
+            args.format,
+            title=f"LXC {vmid} Convert To Template",
+        )
+        if not tpl_resp["ok"]:
+            return _exit_code_for(tpl_resp)
+        print()
+        print(f"LXC {vmid} is now a template. Clone from it with:")
+        print(f"  lxc clone --node {node} --vmid {vmid} --new-vmid <id> --hostname <name> --execute")
+        print()
+        print("Clones of it inherit the injected SSH key, so guest SSH works without a")
+        print("console login. If you also want a working console on clones, apply the")
+        print("Debian 13 console drop-in to this template first: start it temporarily,")
+        print("run `lxc pct-exec`, then stop and convert.")
+        return EXIT_SUCCESS
+
+    if _is_debian_13_template(args.ostemplate):
         print()
         print(_lxc_console_fix_instructions(vmid))
-    return _exit_code_for(resp)
+    return exit_code
 
 
 def _clone_execute(

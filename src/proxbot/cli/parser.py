@@ -204,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_create.add_argument("--ssh-keygen", action="store_true", help="Generate a new SSH key pair and inject the public key")
     lxc_create.add_argument("--ssh-key-path", help="Path to save generated SSH key (default: ./.lxc-ssh-key-<VMID>)")
     lxc_create.add_argument("--data", help="JSON body for extra parameters")
+    lxc_create.add_argument("--as-template", action="store_true", help="Convert the new container to a template after creation (for building a keyed base image that clones inherit)")
     lxc_clone = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("clone", help="Clone LXC or converted LXC template (requires --execute)")))
     lxc_clone.add_argument("--new-vmid", type=int, required=True, help="New container ID (use lxcs next-id)")
     lxc_clone.add_argument("--hostname", help="Hostname for the clone")

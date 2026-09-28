@@ -224,6 +224,9 @@ class CliContractTests(unittest.TestCase):
                 return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {"port": 5900, "ticket": "tick", "user": "root@pam"}, "error": None}
 
             def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
                 return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
 
         args = argparse.Namespace(node="pve", vmid=100, command="uname -r", console=True, timeout=30, execute=True, format="json")
@@ -867,6 +870,102 @@ class NodeTargetGuardTests(unittest.TestCase):
                 code = cli.cmd_ssh_exec(args, self._config(), self.Client(), cli.Logger(None, no_log=True))
         self.assertEqual(code, cli.EXIT_SUCCESS)
         self.assertIn("guest ok", out.getvalue())
+
+
+class AsTemplateTests(unittest.TestCase):
+    """`lxc create --as-template` builds a keyed base image for clones to inherit."""
+
+    def _config(self):
+        return cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+
+    def _args(self, **extra):
+        base = dict(node="pve", vmid=90001, hostname="base", storage="local",
+                    ostemplate="local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst",
+                    ssh_public_keys="ssh-ed25519 AAAA test@host", ssh_keygen=False,
+                    unprivileged=True, features=None, password=None, cores=None, memory=None,
+                    swap=None, net0=None, rootfs=None, nameserver=None, onboot=None,
+                    data=None, execute=True, wait=True, wait_timeout=60, as_template=True, format="json")
+        base.update(extra)
+        return argparse.Namespace(**base)
+
+    def test_dry_run_shows_the_followup_template_call(self):
+        args = self._args(execute=False)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_lxc_create(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["data"]["target"]["then"], "POST /nodes/pve/lxc/90001/template")
+
+    def test_create_then_converts_to_template(self):
+        calls = []
+
+        class Client:
+            def post(self, endpoint, body):
+                calls.append((endpoint, body))
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": "UPID:pve:00001234", "error": None}
+
+            def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        args = self._args()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exit_code = cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertEqual(calls[0][0], "/nodes/pve/lxc")
+        self.assertEqual(calls[0][1]["ssh-public-keys"], "ssh-ed25519 AAAA test@host")
+        self.assertEqual(calls[1][0], "/nodes/pve/lxc/90001/template")
+
+    def test_template_conversion_failure_is_reported(self):
+        class Client:
+            def post(self, endpoint, body):
+                if endpoint.endswith("/template"):
+                    return {"ok": False, "status_code": 500, "duration_ms": 1,
+                            "data": None, "error": "unable to open template"}
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": "UPID:pve:00001234", "error": None}
+
+            def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        args = self._args()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exit_code = cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertNotEqual(exit_code, cli.EXIT_SUCCESS)
+
+    def test_without_flag_no_template_call(self):
+        calls = []
+
+        class Client:
+            def post(self, endpoint, body):
+                calls.append(endpoint)
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": "UPID:pve:00001234", "error": None}
+
+            def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        args = self._args(as_template=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(calls, ["/nodes/pve/lxc"])
 
 
 class TemplateRegistryTests(unittest.TestCase):
