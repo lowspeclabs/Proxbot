@@ -210,7 +210,7 @@ def lxc_exec(
         prompt_detected = login_prompt_detected or password_prompt_detected
 
         def _no_console_login(reason: str) -> dict[str, Any]:
-            """A login prompt was never observed, so no credential was tested."""
+            """No credential prompt was observed, so no credential was tested."""
             sock.close()
             return {
                 "ok": False,
@@ -218,10 +218,12 @@ def lxc_exec(
                 "vmid": vmid,
                 "node": node,
                 "error": (
-                    f"Container {vmid} console is silent — no login or password prompt was "
-                    f"received on tty1, so {reason} There is no getty/login running in the "
-                    f"guest to authenticate against. Use SSH, or start a getty on tty1 in the "
-                    f"guest; the console cannot be used to run commands here."
+                    f"Container {vmid}: no login or password prompt was received on this console "
+                    f"attachment, so {reason} The LXC console is a single shared pty whose prompt is "
+                    f"not reliably replayed on attach, and another session may hold it, so this is "
+                    f"not evidence of a bad password. Verify from inside the guest with "
+                    f"`systemctl is-active getty@tty1`. For automated commands use SSH, or "
+                    f"`pct exec {vmid} -- <cmd>` from the node."
                 ),
                 "method": "termproxy",
             }
