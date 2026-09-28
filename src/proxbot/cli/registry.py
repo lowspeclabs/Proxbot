@@ -50,6 +50,8 @@ _SUPPORT = {
         "lxc_exec",
         "assemble_pct_exec",
         "probe_node_ssh",
+        "_read_password_fd",
+        "_resolve_node_password",
         "filter_registry_rows",
         "filter_rows",
     }

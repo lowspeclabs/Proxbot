@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import os
 import shlex
 import subprocess
 import sys
@@ -26,7 +27,13 @@ from typing import Any
 
 from ...common.client import ProxmoxClient
 from ...common.config import Config
-from ...common.constants import EXIT_INTERNAL, EXIT_SUCCESS, EXIT_TIMEOUT, EXIT_VALIDATION
+from ...common.constants import (
+    EXIT_AUTH,
+    EXIT_INTERNAL,
+    EXIT_SUCCESS,
+    EXIT_TIMEOUT,
+    EXIT_VALIDATION,
+)
 from ...common.logging_ import Logger
 from ...common.render import emit_error, emit_output
 from ...common.safety import emit_dry_run, request_plan, require_execute
@@ -146,6 +153,42 @@ def probe_node_ssh(node: str, config: Config, client: ProxmoxClient | None) -> d
     return report
 
 
+def _read_password_fd(fd: int) -> str:
+    """Read a password from an inherited file descriptor.
+
+    Used by the chat harness so a prompted node password never appears in argv
+    (visible to every local user via /proc/*/cmdline) or in the environment.
+
+    Takes ownership of the descriptor and closes it.
+    """
+    if fd < 0:
+        return ""
+    try:
+        handle = os.fdopen(fd, "r")
+    except OSError as exc:
+        raise ValueError(f"could not open password descriptor {fd}: {exc}") from exc
+    with handle:
+        # One line, bounded: a password longer than this is a mistake or an
+        # attempt to make us buffer something unbounded.
+        return handle.readline(4096).rstrip("\n")
+
+
+def _resolve_node_password(args: argparse.Namespace, config: Config) -> str | None:
+    """Explicit --node-password wins; otherwise a configured password; otherwise an fd."""
+    explicit = getattr(args, "node_password", None)
+    if explicit:
+        return explicit
+
+    fd = getattr(args, "node_password_fd", None)
+    if fd is not None:
+        try:
+            return _read_password_fd(fd) or None
+        except ValueError as exc:
+            raise exc
+
+    return config.node_ssh_password
+
+
 def cmd_pct_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient, logger: Logger) -> int:
     """Run a command inside an LXC via the node. Node, argv and user are not caller-supplied."""
     node = args.node or config.default_node
@@ -189,21 +232,37 @@ def cmd_pct_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
         )
 
     if not config.node_ssh_configured:
+        # Distinguish "the operator never configured node access" from "node
+        # access is set up but the credential is a password, which the harness
+        # can collect interactively". Only the second is worth prompting for.
+        promptable = bool(
+            config.node_ssh_user
+            and not config.node_ssh_key
+            and not config.node_ssh_password
+        )
+        status = "node_password_required" if promptable else "node_ssh_unconfigured"
+        error = (
+            f"Node {node} needs a password for SSH as {config.node_ssh_user}. "
+            f"pct exec is the only exec path that reaches this container, so supply the "
+            f"password interactively, or set PROXMOX_NODE_SSH_KEY instead. No host-side "
+            f"command was attempted."
+            if promptable else
+            f"pct exec is unavailable: node SSH is not configured (missing "
+            f"{', '.join(config.node_ssh_missing())}). Run `doctor --live --node-access` to "
+            f"re-check, or use guest SSH. No host-side command was attempted."
+        )
         emit_output(
             {
                 "ok": False,
-                "status": "node_ssh_unconfigured",
-                "data": {"node": node, "vmid": vmid, "missing": config.node_ssh_missing()},
-                "error": (
-                    f"pct exec is unavailable: node SSH is not configured (missing "
-                    f"{', '.join(config.node_ssh_missing())}). Run `doctor --live --node-access` to "
-                    f"re-check, or use guest SSH. No host-side command was attempted."
-                ),
+                "status": status,
+                "data": {"node": node, "vmid": vmid, "missing": config.node_ssh_missing(),
+                         "user": config.node_ssh_user},
+                "error": error,
             },
             args.format,
             title=f"PCT Exec ({vmid} on {node})",
         )
-        return EXIT_VALIDATION
+        return EXIT_AUTH if promptable else EXIT_VALIDATION
 
     from .exec import _run_ssh_command
 
@@ -222,8 +281,20 @@ def cmd_pct_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
         return EXIT_INTERNAL
 
     timeout = getattr(args, "timeout", None) or config.timeout_seconds
-    # An explicit --node-password overrides the configured one for this call.
-    node_password = getattr(args, "node_password", None) or config.node_ssh_password
+    try:
+        node_password = _resolve_node_password(args, config)
+    except ValueError as exc:
+        emit_output(
+            {
+                "ok": False,
+                "status": "node_password_read_failed",
+                "data": {"node": node, "vmid": vmid},
+                "error": str(exc),
+            },
+            args.format,
+            title=f"PCT Exec ({vmid} on {node})",
+        )
+        return EXIT_VALIDATION
     start = time.time()
     try:
         code, stdout, stderr = _run_ssh_command(

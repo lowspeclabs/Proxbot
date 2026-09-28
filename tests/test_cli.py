@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -705,8 +706,8 @@ class PctExecTests(unittest.TestCase):
         def _explode(*_a, **_k):
             raise AssertionError("must not SSH when node access is unconfigured")
 
-        args = argparse.Namespace(node="pve", vmid=170, command="id", timeout=30,
-                                  execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=True, format="json")
         stderr = io.StringIO()
         with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
             with contextlib.redirect_stderr(stderr):
@@ -755,8 +756,8 @@ class PctExecTests(unittest.TestCase):
         self.assertEqual(result["data"]["transport"], "pct_exec")
 
     def test_dry_run_by_default_shows_the_remote_command(self):
-        args = argparse.Namespace(node="pve", vmid=170, command="id", timeout=30,
-                                  execute=False, format="json")
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=False, format="json")
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
@@ -780,6 +781,84 @@ class PctExecTests(unittest.TestCase):
         config = self._config(PROXMOX_NODE_SSH_USER="root")
         self.assertFalse(config.node_ssh_configured)
         self.assertIn("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD", config.node_ssh_missing())
+
+    def test_asks_for_a_password_when_only_a_user_is_set(self):
+        # A user with no credential is promptable, so the harness collects the
+        # password rather than reporting a configuration error.
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = cli.cmd_pct_exec(args, config, None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_AUTH)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "node_password_required")
+        self.assertEqual(result["data"]["user"], "root")
+
+    def test_key_set_is_never_prompted(self):
+        # With a key configured there is nothing to prompt for.
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH when no address is resolvable")
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_KEY="/k")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cli.cmd_pct_exec(args, config, None, cli.Logger(None, no_log=True))
+        self.assertNotEqual(code, cli.EXIT_AUTH)
+        self.assertNotEqual(json.loads(err.getvalue())["status"], "node_password_required")
+
+    def test_reads_password_from_inherited_fd(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"from-fd\n")
+        os.close(write_fd)
+        # _read_password_fd takes ownership of the descriptor, so it is already
+        # closed here and must not be closed again by the caller.
+        self.assertEqual(cli._read_password_fd(read_fd), "from-fd")
+
+    def test_reads_password_from_a_descriptor_with_no_trailing_newline(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"no-newline")
+        os.close(write_fd)
+        self.assertEqual(cli._read_password_fd(read_fd), "no-newline")
+
+    def test_unreadable_descriptor_is_reported_not_raised(self):
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=9999, timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="env-pw")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_VALIDATION)
+        self.assertEqual(json.loads(stderr.getvalue())["status"], "node_password_read_failed")
+
+    def test_explicit_password_wins_over_fd(self):
+        self.assertEqual(
+            cli._resolve_node_password(
+                argparse.Namespace(node_password="explicit", node_password_fd=-1), self._config()
+            ),
+            "explicit",
+        )
+
+    def test_fd_wins_over_configured_password(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"from-fd\n")
+        os.close(write_fd)
+        resolved = cli._resolve_node_password(
+            argparse.Namespace(node_password=None, node_password_fd=read_fd),
+            self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="env-pw"),
+        )
+        self.assertEqual(resolved, "from-fd")
 
     def test_passes_configured_password_to_ssh(self):
         seen = {}

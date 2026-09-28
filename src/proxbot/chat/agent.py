@@ -85,11 +85,16 @@ Guidelines:
             {"role": "system", "content": self.SYSTEM_PROMPT}
         ]
         self.watchdog = LoopWatchdog()
+        # Node SSH passwords collected by getpass, keyed by node. Session
+        # lifetime only: never persisted, never logged, never placed in the
+        # message history, and not carried across clear_history().
+        self._node_prompts: Dict[str, str] = {}
 
     def clear_history(self) -> None:
         """Reset conversation context while keeping the system prompt."""
         self.messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
         self.watchdog = LoopWatchdog()
+        self._node_prompts.clear()
 
     def _prune_history(self) -> None:
         """Prune older tool response payloads to prevent context overflow."""
@@ -99,6 +104,34 @@ Guidelines:
                 if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
                     if len(msg["content"]) > 1000:
                         msg["content"] = msg["content"][:1000] + "... [Older tool output truncated for context]"
+
+    # Benign notices that ssh(1) writes to stderr on every connection because of
+    # how this harness invokes it (UserKnownHostsFile=/dev/null, so the host key
+    # is never actually remembered). They are not failures and must not be
+    # rendered as one. Matched per line: every non-blank line of the reported
+    # detail must be benign for the result to count as a warning.
+    _BENIGN_SSH_NOTICE_RE = re.compile(
+        r"(?i)^(?:"
+        r"warning:\s*permanently added .* to the list of known hosts\.?"
+        r"|pseudo-terminal will not be allocated because stdin is not a terminal\.?"
+        r"|warning:\s*identity file .* not accessible:.*"
+        r"|the authenticity of host .* can't be established\..*"
+        r"|host key verification failed\.?"
+        r")$"
+    )
+
+    def _is_benign_notice(self, result: Dict[str, Any]) -> bool:
+        """True when every reported detail, across every populated field, is SSH chatter."""
+        checked = False
+        for key in ("error", "stderr", "raw_output"):
+            value = result.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            checked = True
+            for line in value.splitlines():
+                if line.strip() and not self._BENIGN_SSH_NOTICE_RE.match(line.strip()):
+                    return False
+        return checked
 
     def _extract_error_detail(self, result: Dict[str, Any]) -> str:
         """Extract a clean, concise error summary string from a tool result."""
@@ -390,12 +423,49 @@ Guidelines:
                             result = self.executor.execute(name, auth_args)
                             duration = time.time() - t0
 
+                    # Node password escalation for the pct exec transport. Kept
+                    # in memory for the session only, passed over a pipe fd
+                    # rather than argv, and never logged or put in the message
+                    # history — the retry does not echo it back at all.
+                    node_secret: str | None = None
+                    if name == "lxc_pct_exec" and result.get("status") == "node_password_required":
+                        target_node = args.get("node") or "the configured node"
+                        target_user = (result.get("data") or {}).get("user") or "root"
+                        cached = self._node_prompts.get(target_node)
+                        if cached:
+                            node_secret = cached
+                        else:
+                            try:
+                                pwd = getpass.getpass(
+                                    f"  Node password for {target_user}@{target_node} "
+                                    f"(Enter to cancel): "
+                                )
+                            except (EOFError, KeyboardInterrupt):
+                                pwd = ""
+                            if pwd:
+                                # Reused for the rest of this session so the
+                                # operator is not asked once per command.
+                                self._node_prompts[target_node] = pwd
+                                node_secret = pwd
+
+                        if node_secret:
+                            if not cached:
+                                print(f"  {GRAY}Authenticating…{RESET}")
+                            t0 = time.time()
+                            result = self.executor.execute(name, args, secret=node_secret)
+                            duration = time.time() - t0
+
                     is_ok = result.get("ok", False)
                     if is_ok:
                         print(f"  {GREEN}✓{RESET} {GRAY}{duration:.1f}s{RESET}")
                     else:
                         err_msg = self._extract_error_detail(result)
-                        print(f"  {RED}✗ {err_msg}{RESET} {GRAY}({duration:.1f}s){RESET}")
+                        # Routine ssh(1) chatter is not a failure; reserve the red
+                        # cross for real faults.
+                        if self._is_benign_notice(result):
+                            print(f"  {YELLOW}! {err_msg}{RESET} {GRAY}({duration:.1f}s){RESET}")
+                        else:
+                            print(f"  {RED}✗ {err_msg}{RESET} {GRAY}({duration:.1f}s){RESET}")
 
                     # Sanitize result to ensure password never enters logs or messages.
                     # _redact() already runs inside logger.log, but the tool message

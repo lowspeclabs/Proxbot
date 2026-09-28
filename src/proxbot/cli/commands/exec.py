@@ -433,7 +433,12 @@ def _run_ssh_command(
         "ssh",
         "-p", str(port),
         "-o", "StrictHostKeyChecking=accept-new",
+        # With UserKnownHostsFile=/dev/null the host key is never actually
+        # remembered, so "Permanently added ..." fires on every single
+        # connection and tells the operator nothing. LogLevel=ERROR suppresses
+        # that notice (and nothing at ERROR or above).
         "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
         "-o", "ConnectTimeout=10",
     ]
     if key_file and pathlib.Path(key_file).exists():

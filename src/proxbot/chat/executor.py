@@ -4,7 +4,8 @@ import json
 import pathlib
 import subprocess
 import sys
-from typing import Any, Dict, List
+import os
+from typing import Any, Dict, List, Optional
 
 from .spec import HARNESS_ASSEMBLED_TOOLS
 from .watchdog import validate_harness_command
@@ -332,8 +333,14 @@ class ProxmoxToolExecutor:
                 idx += 1
         return docs
 
-    def _raw_execute(self, cli_args: List[str]) -> Dict[str, Any]:
-        """Execute CLI command directly and parse JSON (stdout or stderr)."""
+    def _raw_execute(self, cli_args: List[str], secret: Optional[str] = None) -> Dict[str, Any]:
+        """Execute CLI command directly and parse JSON (stdout or stderr).
+
+        `secret` is handed to the child on an inherited pipe file descriptor
+        rather than in argv, so a prompted node password never appears in the
+        process table or the environment. The data is buffered by the kernel
+        before the child starts, so writing before the spawn cannot deadlock.
+        """
         full_cmd = [
             sys.executable,
             str(self.cli_path),
@@ -341,28 +348,65 @@ class ProxmoxToolExecutor:
             "--format", "json"
         ] + cli_args
 
+        read_fd = write_fd = None
+        if secret is not None:
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, secret.encode("utf-8")[:4096] + b"\n")
+            except OSError:
+                os.close(read_fd)
+                os.close(write_fd)
+                read_fd = write_fd = None
+            else:
+                os.close(write_fd)
+                write_fd = None
+                full_cmd = full_cmd + ["--node-password-fd", str(read_fd)]
+
         try:
-            proc = subprocess.run(full_cmd, capture_output=True, text=True, timeout=180)
-            stdout = proc.stdout.strip()
-            stderr = proc.stderr.strip()
-            # CLI sends failures to stderr, successes to stdout — check both.
-            # Take the LAST parseable doc (final result wins over intermediate fallback output).
-            for stream_text in (stdout, stderr):
-                docs = self._parse_cli_json_blobs(stream_text)
-                if docs:
-                    return docs[-1]
-            combined = (stdout + "\n" + stderr).strip()
-            if combined:
-                docs = self._parse_cli_json_blobs(combined)
-                if docs:
-                    return docs[-1]
-                return {"ok": proc.returncode == 0, "raw_output": combined[:2000], "returncode": proc.returncode}
-            return {"ok": proc.returncode == 0, "error": f"Process exited with code {proc.returncode}"}
+            proc = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                pass_fds=(read_fd,) if read_fd is not None else (),
+            )
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+        finally:
+            if read_fd is not None:
+                try:
+                    os.close(read_fd)
+                except OSError:
+                    pass
 
-    def execute(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a tool command, automatically handling multi-node queries and auto-stop before delete."""
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        # CLI sends failures to stderr, successes to stdout — check both.
+        # Take the LAST parseable doc (final result wins over intermediate fallback output).
+        for stream_text in (stdout, stderr):
+            docs = self._parse_cli_json_blobs(stream_text)
+            if docs:
+                return docs[-1]
+        combined = (stdout + stderr).strip()
+        if combined:
+            docs = self._parse_cli_json_blobs(combined)
+            if docs:
+                return docs[-1]
+            return {"ok": proc.returncode == 0, "raw_output": combined[:2000], "returncode": proc.returncode}
+        return {"ok": proc.returncode == 0, "error": f"Process exited with code {proc.returncode}"}
+
+    def execute(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        secret: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute a tool command, automatically handling multi-node queries and auto-stop before delete.
+
+        `secret` is forwarded to a harness-assembled transport (currently only
+        `lxc_pct_exec`) over a pipe file descriptor, never through `arguments`.
+        """
+
         # Second enforcement layer. The watchdog in agent.py already refuses
         # malformed harness-assembled calls, but the executor is also reachable
         # directly (tests, the broker, any future caller), so the check is
@@ -487,4 +531,8 @@ class ProxmoxToolExecutor:
         except Exception as err:
             return {"ok": False, "error": f"Invalid tool arguments: {err}"}
 
-        return self._raw_execute(cli_args)
+        # Only transports that accept the pipe channel may be handed a secret.
+        if secret is not None and tool_name not in HARNESS_ASSEMBLED_TOOLS:
+            return {"ok": False, "error": f"{tool_name} does not accept a secret channel."}
+
+        return self._raw_execute(cli_args, secret=secret)

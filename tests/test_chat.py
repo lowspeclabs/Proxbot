@@ -351,6 +351,168 @@ class ToolExecutorArgsTests(unittest.TestCase):
         self.assertNotIn("templates_download", chat.READ_ONLY_TOOLS)
 
 
+class NodePasswordPromptTests(unittest.TestCase):
+    """The harness collects a node password once per session and keeps it out of argv."""
+
+    def _agent(self, executor, tmpdir):
+        logger = chat.SessionLogger(pathlib.Path(tmpdir))
+        return chat.ChatAgent(
+            base_url="http://mock-llm:1234/v1",
+            api_key="k", model="m", temperature=0.1, max_turns=3,
+            executor=executor, safety_gate=chat.SafetyGate(auto_approve=True),
+            logger=logger,
+        )
+
+    def _stream(self, tool_name, arguments, answer="done"):
+        tool = json.dumps({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "c1", "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps(arguments)},
+        }]}}]})
+        done = json.dumps({"choices": [{"delta": {"content": answer}}]})
+        def _resp(payload):
+            r = mock.MagicMock()
+            r.status_code = 200
+            r.iter_lines.return_value = [f"data: {payload}".encode(), b"data: [DONE]"]
+            return r
+        return [_resp(tool), _resp(done)]
+
+    def test_prompts_once_and_retries_with_the_secret(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.side_effect = [
+                {"ok": False, "status": "node_password_required",
+                 "data": {"user": "root"}, "error": "needs a password"},
+                {"ok": True, "data": {"exit_code": 0, "stdout": "hello\n"}},
+            ]
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value="node-secret") as prompt:
+                    agent.chat("run id")
+
+            prompt.assert_called_once()
+            self.assertIn("root@pveheavy", prompt.call_args[0][0])
+            self.assertEqual(executor.execute.call_count, 2)
+            # The secret travels on the dedicated channel, never in arguments.
+            retry = executor.execute.call_args_list[1]
+            self.assertEqual(retry.kwargs.get("secret"), "node-secret")
+            self.assertNotIn("node-secret", json.dumps(retry.args[1]))
+
+    def test_second_call_reuses_the_cached_password_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.return_value = {
+                "ok": False, "status": "node_password_required",
+                "data": {"user": "root"}, "error": "needs a password",
+            }
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value="node-secret") as prompt:
+                    agent.chat("run id")
+                    agent.chat("run id again")
+            self.assertEqual(prompt.call_count, 1)
+            self.assertEqual(agent._node_prompts.get("pveheavy"), "node-secret")
+
+    def test_cancelled_prompt_does_not_retry_and_does_not_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.return_value = {
+                "ok": False, "status": "node_password_required",
+                "data": {"user": "root"}, "error": "needs a password",
+            }
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value=""):
+                    agent.chat("run id")
+            self.assertEqual(executor.execute.call_count, 1)
+            self.assertEqual(agent._node_prompts, {})
+
+    def test_clear_history_drops_the_cached_password(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._agent(mock.MagicMock(), tmpdir)
+            agent._node_prompts["pveheavy"] = "node-secret"
+            agent.clear_history()
+            self.assertEqual(agent._node_prompts, {})
+
+    def test_other_tools_never_prompt_for_a_node_password(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.return_value = {
+                "ok": False, "status": "login_required",
+                "data": {"user": "root"}, "error": "console login required",
+            }
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value="") as prompt:
+                    agent.chat("run id")
+            # lxc_exec's own console escalation is separate; it must not be
+            # handed a node secret, and no retry may happen when cancelled.
+            self.assertEqual(executor.execute.call_count, 1)
+
+
+class BenignNoticeTests(unittest.TestCase):
+    """Routine ssh(1) chatter must not be rendered as a failure."""
+
+    def _agent(self, tmpdir="."):
+        return chat.ChatAgent(
+            base_url="http://mock-llm:1234/v1", api_key="k", model="m",
+            temperature=0.1, max_turns=3, executor=mock.MagicMock(),
+            safety_gate=chat.SafetyGate(auto_approve=True),
+            logger=chat.SessionLogger(pathlib.Path(tmpdir)),
+        )
+
+    NOTICE = ("Warning: Permanently added '192.168.1.164' (ED25519) "
+              "to the list of known hosts.\n")
+
+    def test_known_hosts_notice_is_benign(self):
+        self.assertTrue(self._agent()._is_benign_notice(
+            {"ok": False, "stderr": self.NOTICE}))
+
+    def test_notice_plus_a_real_error_is_not_benign(self):
+        self.assertFalse(self._agent()._is_benign_notice({
+            "ok": False,
+            "stderr": self.NOTICE,
+            "error": "command not found",
+        }))
+
+    def test_notice_alongside_other_stderr_is_not_benign(self):
+        self.assertFalse(self._agent()._is_benign_notice(
+            {"ok": False, "stderr": self.NOTICE + "rm: cannot remove '/x': Permission denied\n"}))
+
+    def test_other_ssh_noise_is_benign(self):
+        for text in (
+            "Pseudo-terminal will not be allocated because stdin is not a terminal.\n",
+            "Warning: Identity file /keys/lxc-170 not accessible: No such file or directory.\n",
+            "The authenticity of host '10.0.0.1' can't be established.\n",
+        ):
+            self.assertTrue(self._agent()._is_benign_notice({"ok": False, "stderr": text}), text)
+
+    def test_host_key_failure_is_benign_but_alone(self):
+        # With UserKnownHostsFile=/dev/null this can be the only reported line.
+        # It is still worth surfacing as a warning rather than a hard error.
+        self.assertTrue(self._agent()._is_benign_notice(
+            {"ok": False, "stderr": "Host key verification failed."}))
+
+    def test_genuine_failure_is_not_benign(self):
+        for text in (
+            "connection refused",
+            "Permission denied (publickey,password).",
+            "rm: cannot remove '/etc/x': Permission denied",
+        ):
+            self.assertFalse(self._agent()._is_benign_notice({"ok": False, "error": text}), text)
+
+    def test_ssh_invocations_suppress_the_known_hosts_notice(self):
+        # UserKnownHostsFile=/dev/null means the key is never remembered, so the
+        # notice fires on every connection. LogLevel=ERROR must be set.
+        from proxbot.cli.commands import exec as guest_exec
+        source = __import__("inspect").getsource(guest_exec._run_ssh_command)
+        self.assertIn("LogLevel=ERROR", source)
+        self.assertIn("UserKnownHostsFile=/dev/null", source)
+
+
 class RollingThoughtStreamerTests(unittest.TestCase):
     def test_lifecycle(self):
         streamer = chat.RollingThoughtStreamer()

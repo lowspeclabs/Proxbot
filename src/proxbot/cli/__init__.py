@@ -52,5 +52,6 @@ from .commands._shared import (  # noqa: F401
     _wait_for_task,
 )
 from .commands.exec import _parse_console_output, _resolve_guest_ip, _run_ssh_command  # noqa: F401
+from .commands.nodessh import _read_password_fd, _resolve_node_password  # noqa: F401
 from .registry import *  # noqa: F401,F403
 from .main import main  # noqa: F401
