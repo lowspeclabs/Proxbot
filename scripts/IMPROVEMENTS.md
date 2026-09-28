@@ -350,3 +350,14 @@ Track proposed improvements while developing or using `scripts/Proxmox-cli.py`.
 - Tradeoffs: Containers with no guest SSH and no node access are now unreachable to the agent, where previously the console would be tried and would usually type into someone's session. That is the intended trade: an honest refusal beats an unreliable and unsafe one. Node SSH also means ProxBot can hold root on a hypervisor, which is why it is off by default and separately gated.
 - Follow-up: `PROXMOX_NODE_SSH_TARGETS` is currently all-or-nothing per target. Consider scoping it per command class, and consider an allowlist of `pct` subcommands rather than only subcommand-prefix checks.
 - Related files: `src/proxbot/cli/commands/nodessh.py`, `src/proxbot/cli/commands/exec.py`, `src/proxbot/chat/watchdog.py`, `src/proxbot/chat/executor.py`, `src/proxbot/chat/spec.py`, `.env.example`, `tests/test_cli.py`, `tests/test_chat.py`
+
+## 2026-09-28 — Route the known-hosts notice away, and never render chatter as a failure
+
+- Status: implemented
+- Area: logging | cli
+- Reason: Every SSH-backed exec printed `Warning: Permanently added '10.0.0.5' (ED25519) to the list of known hosts.` on stderr. On a failed command the harness printed that as `✗` in red, so the operator saw a red cross whose only content was routine ssh(1) chatter, and the real error was pushed out of view. The cause is self-inflicted: the harness passes `UserKnownHostsFile=/dev/null`, so the host key is never remembered and the notice fires on every single connection while carrying no information.
+- Suggested change:
+  - Pass `-o LogLevel=ERROR` to `ssh`, which suppresses the notice and nothing at ERROR or above. Verified live: the notice disappears while a genuine `Permission denied (publickey,password).` still surfaces.
+  - Added `_is_benign_notice()` so anything that slips through anyway renders as a yellow `!` rather than a red `✗`. It matches per line and requires *every* populated field (`error`, `stderr`, `raw_output`) to be benign, so a real error reported alongside a known-hosts notice stays red. Classifying per line rather than by a single `sub()` matters: a substring pattern consumed only the `Warning: Permanently added` prefix and left the rest of the line looking like a fault.
+- Tradeoffs: Host-key changes are no longer announced per connection. That was already the case in practice — with `UserKnownHostsFile=/dev/null` the key is re-learned every time, so there is no stored key to change.
+- Related files: `src/proxbot/cli/commands/exec.py`, `src/proxbot/chat/agent.py`, `tests/test_chat.py`, `README.md`, `AGENTS.md`

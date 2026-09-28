@@ -82,8 +82,9 @@ def cmd_doctor(args: argparse.Namespace, config: Config, client: ProxmoxClient, 
     # this probe succeeds, and the result is what the operator acts on.
     if args.node_access:
         probes = []
-        if args.node:
-            probe_nodes = [args.node]
+        requested_node = getattr(args, "node", None)
+        if requested_node:
+            probe_nodes = [requested_node]
         else:
             nodes_resp = client.get("/nodes")
             probe_nodes = [

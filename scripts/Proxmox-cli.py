@@ -31,6 +31,8 @@ from proxbot.cli import (  # noqa: F401,E402
     _run_ssh_command,
     _parse_console_output,
     lxc_exec,
+    _read_password_fd,
+    _resolve_node_password,
     filter_registry_rows,
     filter_rows,
     load_env,

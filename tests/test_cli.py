@@ -980,6 +980,30 @@ class PctExecTests(unittest.TestCase):
         self.assertIn("opt-in", data["exec_transports"]["console"])
         self.assertFalse(data["node_ssh"]["configured"])
 
+    def test_doctor_node_access_survives_absence_of_node_arg(self):
+        # `doctor` has no --node flag, so reading args.node directly raised
+        # AttributeError. Use --node-access, which probes every node.
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/version":
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"version": "9.1.5"}, "error": None}
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(live=True, node_access=True, format="json")  # no .node
+        config = self._config(PROXMOX_API_URL="https://pve.example/api2/json",
+                              PROXMOX_API_TOKEN_ID="a@b!c", PROXMOX_API_TOKEN_SECRET="s")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_doctor(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        data = json.loads(stdout.getvalue())["data"]
+        self.assertIn("node_access", data)
+        self.assertEqual([p["node"] for p in data["node_access"]], ["pve"])
+        self.assertFalse(data["pct_exec_available"])
+
 
 class NodeTargetGuardTests(unittest.TestCase):
     """`ssh exec` must not double as a host shell that bypasses pct exec."""
