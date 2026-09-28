@@ -48,6 +48,10 @@ class Config:
         self.node_ssh_user = (raw.get("PROXMOX_NODE_SSH_USER") or "").strip() or None
         self.node_ssh_port = _parse_int(raw.get("PROXMOX_NODE_SSH_PORT", "22"), 22)
         self.node_ssh_key = (raw.get("PROXMOX_NODE_SSH_KEY") or "").strip() or None
+        # Password auth for the node, as an alternative to a key. A key is
+        # preferred when both are set: it does not leave a reusable secret in
+        # .env and does not need SSH_ASKPASS on every call.
+        self.node_ssh_password = raw.get("PROXMOX_NODE_SSH_PASSWORD") or None
         # Resolved from the cluster at runtime when unset; see node_ssh_hosts().
         self.node_ssh_timeout = _parse_int(raw.get("PROXMOX_NODE_SSH_TIMEOUT", "10"), 10)
         # Escape hatch for the ssh_exec guard. Off by default: a node is a much
@@ -79,14 +83,21 @@ class Config:
     @property
     def node_ssh_configured(self) -> bool:
         """True when enough is set to attempt node SSH (host comes from the API)."""
-        return bool(self.node_ssh_user and self.node_ssh_key)
+        return bool(self.node_ssh_user and (self.node_ssh_key or self.node_ssh_password))
+
+    @property
+    def node_ssh_auth_method(self) -> str | None:
+        """Which credential node SSH will actually use. Key wins over password."""
+        if not self.node_ssh_configured:
+            return None
+        return "key" if self.node_ssh_key else "password"
 
     def node_ssh_missing(self) -> list[str]:
         missing = []
         if not self.node_ssh_user:
             missing.append("PROXMOX_NODE_SSH_USER")
-        if not self.node_ssh_key:
-            missing.append("PROXMOX_NODE_SSH_KEY")
+        if not (self.node_ssh_key or self.node_ssh_password):
+            missing.append("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD")
         return missing
 
 

@@ -8,6 +8,7 @@ import sys
 import uuid
 from typing import Any, Dict, Optional
 
+from ..common.redact import redact_command_secrets
 from .markdown import RED, RESET
 
 
@@ -42,13 +43,11 @@ class SessionLogger:
         elif isinstance(obj, str):
             if "PVEAPIToken=" in obj:
                 obj = re.sub(r"PVEAPIToken=[^=\s]+=[^\s]+", "PVEAPIToken=***REDACTED***", obj)
-            # Scrub `--password <secret>` leaked inside joined command strings
-            # (Proxmox-cli used to embed the raw password in its `command` field).
-            obj = re.sub(
-                r"(?i)(--password|--token-secret|--api-token-secret|--secret|--private-key)(\s+|=)(\"[^\"]*\"|'[^']*'|\S+)",
-                r"\1\2***REDACTED***",
-                obj,
-            )
+            # Scrub secret-bearing flags leaked inside joined command strings
+            # (Proxmox-cli used to embed the raw password in its `command`
+            # field). Shared pattern, so a new flag cannot leak here while
+            # being redacted elsewhere.
+            obj = redact_command_secrets(obj)
             return obj
         return obj
 

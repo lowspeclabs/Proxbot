@@ -765,6 +765,121 @@ class PctExecTests(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["data"]["target"]["remote"], "pct exec 170 -- /bin/sh -lc id")
 
+    # --- password authentication ----------------------------------------
+    def test_password_only_counts_as_configured(self):
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        self.assertTrue(config.node_ssh_configured)
+        self.assertEqual(config.node_ssh_auth_method, "password")
+
+    def test_key_wins_when_both_are_set(self):
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_KEY="/k",
+                              PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        self.assertEqual(config.node_ssh_auth_method, "key")
+
+    def test_user_alone_is_not_configured(self):
+        config = self._config(PROXMOX_NODE_SSH_USER="root")
+        self.assertFalse(config.node_ssh_configured)
+        self.assertIn("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD", config.node_ssh_missing())
+
+    def test_passes_configured_password_to_ssh(self):
+        seen = {}
+
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return (0, "root@node\n", "")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(seen["password"], "s3cret")
+        self.assertIsNone(seen["key_file"])
+
+    def test_explicit_node_password_overrides_config(self):
+        seen = {}
+
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return (0, "ok\n", "")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password="from-flag",
+                                  timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="from-env")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(seen["password"], "from-flag")
+
+    def test_probe_reports_password_auth_without_leaking_it(self):
+        def _fake(**kwargs):
+            return (0, "proxmox-ve 9.1.5", "")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            report = cli.probe_node_ssh("pve", config, Client())
+        self.assertTrue(report["usable"])
+        self.assertEqual(report["auth_method"], "password")
+        # The probe is surfaced to the operator via doctor, so it must not
+        # contain the secret in any form.
+        self.assertNotIn("s3cret", json.dumps(report))
+
+    def test_node_password_is_redacted_in_argv(self):
+        from proxbot.common.redact import _redact_argv
+        redacted = _redact_argv(
+            ["lxc", "pct-exec", "--node", "pve", "--node-password", "s3cret", "--execute"],
+            self._config(),
+        )
+        self.assertNotIn("s3cret", redacted)
+        self.assertIn("***REDACTED***", redacted)
+
+    def test_node_password_is_redacted_in_the_command_string(self):
+        # Regression: the argv form and the joined-string form were separate
+        # patterns, so --node-password was redacted in one and leaked in the
+        # other. Both must now use the same list.
+        from proxbot.common.redact import _redact_command_str, redact_command_secrets
+        for secret_flag in ("--node-password", "--password", "--token-secret",
+                            "--api-token-secret", "--secret", "--private-key"):
+            for sep in (" ", "="):
+                raw = f"lxc pct-exec --vmid 170 {secret_flag}{sep}s3cret --command id"
+                self.assertNotIn("s3cret", _redact_command_str(raw), f"{secret_flag}{sep} leaked via _redact_command_str")
+                self.assertNotIn("s3cret", redact_command_secrets(raw), f"{secret_flag}{sep} leaked via redact_command_secrets")
+
+    def test_argv_and_string_redaction_cover_the_same_flags(self):
+        from proxbot.common.redact import SENSITIVE_ARGV_FLAGS, _redact_argv, redact_command_secrets
+        for flag in SENSITIVE_ARGV_FLAGS:
+            if flag == "--command":
+                continue  # covered separately; it is a value carrier
+            redacted = redact_command_secrets(f"cmd {flag} s3cret")
+            self.assertNotIn("s3cret", redacted, f"{flag} leaks in the string form")
+            argv_redacted = _redact_argv(["cmd", flag, "s3cret"])
+            self.assertNotIn("s3cret", argv_redacted, f"{flag} leaks in the argv form")
+
     def test_probe_reports_unconfigured_without_ssh(self):
         def _explode(*_a, **_k):
             raise AssertionError("probe must not SSH when unconfigured")
@@ -774,7 +889,7 @@ class PctExecTests(unittest.TestCase):
             report = cli.probe_node_ssh("pve", self._config(), None)
         self.assertFalse(report["usable"])
         self.assertFalse(report["configured"])
-        self.assertIn("PROXMOX_NODE_SSH_KEY", report["missing"])
+        self.assertIn("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD", report["missing"])
 
     def test_doctor_reports_transport_availability(self):
         args = argparse.Namespace(live=False, node_access=False, node=None, format="json")

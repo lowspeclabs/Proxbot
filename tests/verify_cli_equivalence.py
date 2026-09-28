@@ -20,6 +20,8 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 #   doctor --node-access probe, plus the `lxc pct-exec` dispatch branch.
 # cmd_lxc_create: --as-template converts a freshly created container to a
 #   template, for building a keyed base image that clones inherit.
+# _redact_command_str: now delegates to the shared secret-flag pattern so the
+#   argv and joined-string forms cannot drift apart.
 # cmd_ssh_exec: refuses Proxmox node targets so the pct exec allowlist
 #   cannot be bypassed with a generic SSH call.
 # cmd_pct_exec and its helpers are new, so they have no baseline to differ from.
@@ -33,6 +35,7 @@ KNOWN_CHANGES = {
     "cmd_vm_exec",
     "lxc_exec",
     "main",
+    "_redact_command_str",
     "Config",
     "Config.__init__",
 }

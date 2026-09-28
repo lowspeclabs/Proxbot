@@ -223,6 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_delete = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("delete", help="Delete LXC (requires --execute --force --confirm)")), destructive=True)
     lxc_pct_exec = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("pct-exec", help="Run a command inside an LXC via the node (pct exec over SSH; requires --execute)")))
     lxc_pct_exec.add_argument("--command", required=True, help="Shell command to run inside the container")
+    lxc_pct_exec.add_argument("--node-password", help="Password for node SSH, overriding PROXMOX_NODE_SSH_PASSWORD (prefer a key: a password is a reusable secret in .env)")
     lxc_fix_console = _cmd(_add_node_vmid_args(lxc_sub.add_parser("fix-console", help="Print Debian 13 LXC console workaround")))
     lxc_fix_console.add_argument("--ostemplate", help="OS template (if not stored in config)")
 

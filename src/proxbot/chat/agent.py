@@ -12,6 +12,7 @@ try:
 except ImportError:
     requests = None
 
+from ..common.redact import redact_command_secrets
 from .markdown import CYAN, GRAY, GREEN, RED, RESET, YELLOW
 from .executor import ProxmoxToolExecutor
 from .safety import SafetyGate
@@ -407,16 +408,12 @@ Guidelines:
                         if isinstance(sanitized_result.get("data"), dict) and "password" in sanitized_result["data"]:
                             sanitized_result["data"]["password"] = "***REDACTED***"
                         if isinstance(sanitized_result.get("command"), str):
-                            sanitized_result["command"] = re.sub(
-                                r"(?i)(--password|--token-secret|--api-token-secret|--secret|--private-key)(\s+|=)(\"[^\"]*\"|'[^']*'|\S+)",
-                                r"\1\2***REDACTED***",
-                                sanitized_result["command"],
+                            sanitized_result["command"] = redact_command_secrets(
+                                sanitized_result["command"]
                             )
                         if isinstance(sanitized_result.get("error"), str):
-                            sanitized_result["error"] = re.sub(
-                                r"(?i)(--password|--token-secret|--api-token-secret|--secret|--private-key)(\s+|=)(\"[^\"]*\"|'[^']*'|\S+)",
-                                r"\1\2***REDACTED***",
-                                sanitized_result["error"],
+                            sanitized_result["error"] = redact_command_secrets(
+                                sanitized_result["error"]
                             )
 
                     self.logger.log("TOOL_RESULT", {"tool": name, "result": sanitized_result, "duration_s": duration})

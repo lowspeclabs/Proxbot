@@ -109,6 +109,7 @@ def probe_node_ssh(node: str, config: Config, client: ProxmoxClient | None) -> d
     report["address"] = address
     report["user"] = config.node_ssh_user
     report["key_file"] = config.node_ssh_key
+    report["auth_method"] = config.node_ssh_auth_method
 
     from .exec import _run_ssh_command  # local import: avoids an import cycle
 
@@ -120,6 +121,7 @@ def probe_node_ssh(node: str, config: Config, client: ProxmoxClient | None) -> d
             user=config.node_ssh_user,
             command=_PROBE_COMMAND,
             key_file=config.node_ssh_key,
+            password=config.node_ssh_password,
             timeout=config.node_ssh_timeout,
         )
     except Exception as exc:  # ssh binary missing, DNS failure, etc.
@@ -194,8 +196,8 @@ def cmd_pct_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
                 "data": {"node": node, "vmid": vmid, "missing": config.node_ssh_missing()},
                 "error": (
                     f"pct exec is unavailable: node SSH is not configured (missing "
-                    f"{', '.join(config.node_ssh_missing())}). Run `doctor --live` to re-check, or "
-                    f"use guest SSH. No host-side command was attempted."
+                    f"{', '.join(config.node_ssh_missing())}). Run `doctor --live --node-access` to "
+                    f"re-check, or use guest SSH. No host-side command was attempted."
                 ),
             },
             args.format,
@@ -220,6 +222,8 @@ def cmd_pct_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
         return EXIT_INTERNAL
 
     timeout = getattr(args, "timeout", None) or config.timeout_seconds
+    # An explicit --node-password overrides the configured one for this call.
+    node_password = getattr(args, "node_password", None) or config.node_ssh_password
     start = time.time()
     try:
         code, stdout, stderr = _run_ssh_command(
@@ -228,6 +232,7 @@ def cmd_pct_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
             user=config.node_ssh_user,
             command=remote,
             key_file=config.node_ssh_key,
+            password=node_password,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
