@@ -511,6 +511,80 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("vm start", diag["hint"])
 
 
+class ConsoleOutputParsingTests(unittest.TestCase):
+    """The console transport must fail closed, never report a false exit 0."""
+
+    BEG = "__PROXBOT_BEG_1__"
+    END = "__PROXBOT_END_1__"
+
+    def _parse(self, text, authenticated=False):
+        return cli._parse_console_output(text, self.BEG, self.END, "170", "pveheavy", 30, authenticated)
+
+    def test_complete_output_reports_exit_code(self):
+        res = self._parse(f"{self.BEG}\nhello\n{self.END}:0\r\n")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["exit_code"], 0)
+        self.assertEqual(res["stdout"], "hello")
+        self.assertNotIn("status", res)
+
+    def test_nonzero_exit_is_reported(self):
+        res = self._parse(f"{self.BEG}\nboom\n{self.END}:127\r\n")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["exit_code"], 127)
+
+    def test_missing_start_marker_is_output_lost(self):
+        res = self._parse("just some scrollback\r\n")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+        self.assertIn("start marker", res["error"])
+
+    def test_missing_end_marker_is_output_lost_not_success(self):
+        # Regression: this used to fall through to return None and be reported
+        # as a transport failure, and an unterminated marker used to imply 0.
+        res = self._parse(f"{self.BEG}\npartial output that scrolled\r\n")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+        self.assertIn("end marker", res["error"])
+        self.assertIn("partial output", res["observed"])
+
+    def test_truncated_exit_status_is_unknown_not_zero(self):
+        # Regression: exit_code defaulted to 0 when ':$?' was not captured.
+        res = self._parse(f"{self.BEG}\noutput\r\n{self.END}")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+        self.assertIn("exit status", res["error"])
+
+    def test_exit_status_looking_like_other_digits_is_not_misread(self):
+        # A prompt or scrollback containing "foo:12" after the end marker must
+        # not be mistaken for the command's exit status.
+        res = self._parse(f"{self.BEG}\nout\r\n{self.END} some prompt:12")
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+
+    def test_output_lost_is_distinct_from_transport_failure(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
+                                  no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        lost = {"ok": False, "status": "output_lost", "vmid": "100", "node": "pve",
+                "error": "Container 100: the command was sent to the console but its result could not be verified",
+                "exit_code": None, "method": "termproxy"}
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(lost)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "output_lost")
+        self.assertIsNone(result["data"]["exit_code"])
+
+
 class TemplateRegistryTests(unittest.TestCase):
     def test_registry_parser_args(self):
         args = cli.build_parser().parse_args([

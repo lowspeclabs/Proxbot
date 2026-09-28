@@ -347,23 +347,76 @@ def lxc_exec(
         sock.close()
 
         text_out = collected.decode("utf-8", errors="replace")
-        if beg_marker in text_out and end_marker in text_out:
-            part = text_out.split(beg_marker, 1)[1]
-            cmd_body, _, end_part = part.partition(end_marker)
-            code_match = re.search(r":([0-9]+)", end_part)
-            exit_code = int(code_match.group(1)) if code_match else 0
-            clean_stdout = strip_ansi(cmd_body).strip()
-            return {
-                "ok": exit_code == 0,
-                "exit_code": exit_code,
-                "stdout": clean_stdout,
-                "stderr": "",
-                "method": "termproxy_authenticated" if password else "termproxy",
-            }
+        return _parse_console_output(text_out, beg_marker, end_marker, vmid, node, timeout, bool(password))
     except Exception:
         pass
 
     return None
+
+
+def _parse_console_output(
+    text_out: str,
+    beg_marker: str,
+    end_marker: str,
+    vmid: str,
+    node: str,
+    timeout: int,
+    authenticated: bool,
+) -> dict[str, Any]:
+    """Fail closed on console output.
+
+    A shared/limited terminal can lose the boundary markers or the trailing
+    exit status. Reporting a missing exit status as 0 tells the agent a failed
+    command succeeded, which is worse than reporting that we do not know.
+    """
+    method = "termproxy_authenticated" if authenticated else "termproxy"
+
+    def _lost(reason: str, observed: str = "") -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "output_lost",
+            "vmid": vmid,
+            "node": node,
+            "error": (
+                f"Container {vmid}: the command was sent to the console but its result could "
+                f"not be verified — {reason}. The console is a shared terminal, so output can "
+                f"scroll past or interleave with another session. The exit status is UNKNOWN; "
+                f"do not assume the command succeeded. Re-run over SSH, or "
+                f"`pct exec {vmid} -- <cmd>` from the node."
+            ),
+            "observed": observed,
+            "exit_code": None,
+            "method": method,
+        }
+
+    if beg_marker not in text_out:
+        return _lost("the start marker was never observed, so the command may not have run at all")
+
+    part = text_out.split(beg_marker, 1)[1]
+    cmd_body, found_end, end_part = part.partition(end_marker)
+    clean_stdout = strip_ansi(cmd_body).strip()
+
+    if not found_end:
+        return _lost(
+            "the end marker was never observed, so the exit status is unknown",
+            observed=clean_stdout[-2000:],
+        )
+
+    code_match = re.match(r"\s*:([0-9]+)", end_part)
+    if not code_match:
+        return _lost(
+            "the exit status was truncated, so the exit code is unknown",
+            observed=clean_stdout[-2000:],
+        )
+
+    exit_code = int(code_match.group(1))
+    return {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "stdout": clean_stdout,
+        "stderr": "",
+        "method": method,
+    }
 
 
 def _run_ssh_command(
@@ -484,7 +537,7 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
     # 2. Try execution via Proxmox termproxy WebSocket API
     term_res = lxc_exec(node, vmid, command, timeout, config, client, logger, user=user, password=password, auto_inject_key=auto_inject_key, key_file=key_file)
     if term_res is not None:
-        if term_res.get("status") in ("login_required", "login_failed", "console_unavailable"):
+        if term_res.get("status") in ("login_required", "login_failed", "console_unavailable", "output_lost"):
             # If password was provided and both termproxy and SSH failed
             emit_output({
                 "ok": False,
@@ -517,14 +570,18 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
         emit_output(result, args.format, title=f"LXC {vmid} Exec (termproxy)")
         return EXIT_SUCCESS if term_res["ok"] else EXIT_INTERNAL
 
-    # 3. Final fallback: the termproxy transport itself failed (no ticket, no
-    # WebSocket upgrade, or a broken frame). That is not a credential problem,
-    # so do not send the operator down the password-escalation path.
+    # 3. The termproxy transport itself never came up: no ticket, no WebSocket
+    # upgrade, or a broken frame stream. Distinct from output_lost, where the
+    # session worked and the result could not be read back.
     emit_output({
         "ok": False,
         "status": "console_unavailable",
         "data": {"vmid": vmid, "node": node, "status": "console_unavailable"},
-        "error": f"Could not establish a termproxy console session for container {vmid} on {node}.",
+        "error": (
+            f"Could not open a termproxy WebSocket to container {vmid} on {node} "
+            f"(no ticket, no upgrade, or the frame stream failed). This is a transport "
+            f"failure, not a credential problem."
+        ),
     }, args.format, title=f"LXC {vmid} Exec (console_unavailable)")
     return EXIT_INTERNAL
 

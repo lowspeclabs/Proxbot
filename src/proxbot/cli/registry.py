@@ -45,6 +45,7 @@ _SUPPORT = {
         "_wait_for_task",
         "_resolve_guest_ip",
         "_run_ssh_command",
+        "_parse_console_output",
         "lxc_exec",
         "filter_registry_rows",
         "filter_rows",
