@@ -18,12 +18,15 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 # build_parser: `lxc exec` gained --console, so the termproxy fallback is opt-in.
 # Config/Config.__init__/cmd_doctor/main: node SSH settings and the
 #   doctor --node-access probe, plus the `lxc pct-exec` dispatch branch.
+# cmd_ssh_exec: refuses Proxmox node targets so the pct exec allowlist
+#   cannot be bypassed with a generic SSH call.
 # cmd_pct_exec and its helpers are new, so they have no baseline to differ from.
 KNOWN_CHANGES = {
     "build_parser",
     "cmd_doctor",
     "cmd_lxc_exec",
     "cmd_pct_exec",
+    "cmd_ssh_exec",
     "cmd_vm_exec",
     "lxc_exec",
     "main",
