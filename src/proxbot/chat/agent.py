@@ -372,9 +372,12 @@ Guidelines:
                     if name == "lxc_exec" and _is_login_required(result):
                         target_node = args.get("node", "N/A")
                         target_vmid = args.get("vmid", "N/A")
+                        # executor.py only emits --user when the model set it, so
+                        # an absent/empty value resolves to the CLI default (root).
+                        target_user = args.get("user") or "root"
                         print(f"\n  {YELLOW}Login required for {target_vmid} on {target_node}.{RESET}")
                         try:
-                            pwd = getpass.getpass(f"  Password for root@{target_node}:{target_vmid} (Enter to cancel): ")
+                            pwd = getpass.getpass(f"  Password for {target_user}@{target_node}:{target_vmid} (Enter to cancel): ")
                         except (EOFError, KeyboardInterrupt):
                             pwd = ""
 

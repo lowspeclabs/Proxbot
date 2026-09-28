@@ -257,6 +257,71 @@ class CliContractTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "login_required")
 
+    def test_lxc_exec_console_unavailable(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        silent = {
+            "ok": False,
+            "status": "console_unavailable",
+            "vmid": "100",
+            "node": "pve",
+            "error": "Container 100 console is silent - no login or password prompt was received on tty1",
+            "method": "termproxy",
+        }
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(silent)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        # Not EXIT_AUTH: no credential was tested, so the chat harness must not
+        # escalate to a getpass prompt.
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "console_unavailable")
+
+    def test_lxc_exec_login_rejected_is_distinct_from_timeout(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        rejected = {
+            "ok": False,
+            "status": "login_failed",
+            "vmid": "100",
+            "node": "pve",
+            "error": "Console login rejected by container 100 - wrong username or password.",
+            "method": "termproxy",
+        }
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(rejected)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "login_failed")
+        self.assertIn("rejected", result["error"])
+
+    def test_lxc_exec_transport_failure_is_not_login_required(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(None)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "console_unavailable")
+
     def test_lxc_exec_with_password(self):
         args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
         config = cli.Config({

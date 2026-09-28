@@ -39,6 +39,16 @@ from ...common.safety import emit_dry_run, request_plan, require_destructive, re
 from ._shared import _exit_code_for, _extract_task, _require_config, _wait_for_task
 from .vm import _diagnose_vm_agent
 
+# Unambiguous console credential prompts. Used to stop the probe early: these
+# tokens only appear when a real getty/login is on the other end.
+_CONSOLE_CREDENTIAL_PROMPT_RE = re.compile(r"(?:login|username|password)\s*:", re.IGNORECASE)
+
+# What agetty/PAM print when the credential is refused.
+_CONSOLE_REJECTED_RE = re.compile(
+    r"login incorrect|authentication failure|access denied|permission denied",
+    re.IGNORECASE,
+)
+
 
 def lxc_exec(
     node: str,
@@ -163,27 +173,64 @@ def lxc_exec(
             sock.close()
             return None
 
-        # Probe console with a newline to inspect active state
+        # Probe console with a newline to inspect active state. Wait on an idle
+        # deadline rather than a frame count: a slow getty must not be reported
+        # as a silent console, and a silent console must not be reported as a
+        # login prompt.
         sock.sendall(encode_frame(b"\n\n"))
-        time.sleep(0.3)
 
         initial_buf = b""
-        sock.settimeout(1.5)
-        for _ in range(8):
+        sock.settimeout(1.0)
+        idle_deadline = time.time() + 2.0
+        empty_reads = 0
+        while time.time() < idle_deadline:
             try:
                 f = read_frame(sock)
-                if f:
-                    initial_buf += f
             except Exception:
+                # Socket timeout with no data: keep waiting until the console has
+                # been idle for the full window before calling it silent.
+                continue
+            if not f:
+                empty_reads += 1
+                if empty_reads >= 3:
+                    break
+                continue
+            empty_reads = 0
+            initial_buf += f
+            idle_deadline = time.time() + 2.0
+            if _CONSOLE_CREDENTIAL_PROMPT_RE.search(
+                strip_ansi(initial_buf.decode("utf-8", errors="replace"))
+            ):
                 break
 
         initial_text = strip_ansi(initial_buf.decode("utf-8", errors="replace")).strip()
-        is_active_shell = bool(re.search(r"(?:[#\$>~#~]|root@[^\s:]+:[^#]+#)\s*$", initial_text))
+        is_active_shell = bool(re.search(r"(?:[#\$>~]|root@[^\s:]+:[^#]+#)\s*$", initial_text))
         login_prompt_detected = bool(re.search(r"(?:login|username)\s*:\s*$", initial_text, re.IGNORECASE))
         password_prompt_detected = bool(re.search(r"password\s*:\s*$", initial_text, re.IGNORECASE))
+        prompt_detected = login_prompt_detected or password_prompt_detected
 
-        # Case 1: Active root shell is NOT present and no password was provided
-        if not is_active_shell and not password:
+        def _no_console_login(reason: str) -> dict[str, Any]:
+            """A login prompt was never observed, so no credential was tested."""
+            sock.close()
+            return {
+                "ok": False,
+                "status": "console_unavailable",
+                "vmid": vmid,
+                "node": node,
+                "error": (
+                    f"Container {vmid} console is silent — no login or password prompt was "
+                    f"received on tty1, so {reason} There is no getty/login running in the "
+                    f"guest to authenticate against. Use SSH, or start a getty on tty1 in the "
+                    f"guest; the console cannot be used to run commands here."
+                ),
+                "method": "termproxy",
+            }
+
+        # Case 1: no password supplied. Only ask for one when a prompt is really
+        # there to answer — otherwise the password would be typed into a void.
+        if not password and not is_active_shell:
+            if not prompt_detected:
+                return _no_console_login("no credential was requested.")
             sock.close()
             prompt_str = initial_text.split("\n")[-1] if initial_text else f"LXC {vmid} login:"
             return {
@@ -196,8 +243,11 @@ def lxc_exec(
                 "method": "termproxy",
             }
 
-        # Case 2: Password provided -> perform console login
+        # Case 2: password supplied -> perform console login against a real prompt
         if password:
+            if not prompt_detected:
+                return _no_console_login(f"the supplied password was not submitted.")
+
             if login_prompt_detected or not password_prompt_detected:
                 sock.sendall(encode_frame(f"{user or 'root'}\r\n".encode("utf-8")))
                 pw_buf = b""
@@ -222,13 +272,15 @@ def lxc_exec(
             sock.settimeout(4.0)
             start_chk = time.time()
             login_success = False
+            login_rejected = False
             while (time.time() - start_chk) < 4.0:
                 try:
                     f = read_frame(sock)
                     if f:
                         auth_chk_buf += f
                         chk_text = strip_ansi(auth_chk_buf.decode("utf-8", errors="replace"))
-                        if "Login incorrect" in chk_text:
+                        if _CONSOLE_REJECTED_RE.search(chk_text):
+                            login_rejected = True
                             break
                         if any(chk_text.rstrip().endswith(s) for s in ("#", "$", "~#", "~$", ">")):
                             login_success = True
@@ -238,12 +290,17 @@ def lxc_exec(
 
             if not login_success:
                 sock.close()
+                error = (
+                    f"Console login rejected by container {vmid} — wrong username or password."
+                    if login_rejected
+                    else f"Container {vmid} accepted the credentials but no shell prompt appeared within 4s."
+                )
                 return {
                     "ok": False,
                     "status": "login_failed",
                     "vmid": vmid,
                     "node": node,
-                    "error": "Console login failed (incorrect password or login timed out).",
+                    "error": error,
                     "method": "termproxy",
                 }
 
@@ -425,7 +482,7 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
     # 2. Try execution via Proxmox termproxy WebSocket API
     term_res = lxc_exec(node, vmid, command, timeout, config, client, logger, user=user, password=password, auto_inject_key=auto_inject_key, key_file=key_file)
     if term_res is not None:
-        if term_res.get("status") in ("login_required", "login_failed"):
+        if term_res.get("status") in ("login_required", "login_failed", "console_unavailable"):
             # If password was provided and both termproxy and SSH failed
             emit_output({
                 "ok": False,
@@ -458,14 +515,16 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
         emit_output(result, args.format, title=f"LXC {vmid} Exec (termproxy)")
         return EXIT_SUCCESS if term_res["ok"] else EXIT_INTERNAL
 
-    # 3. Final fallback: If no password and not logged in, ask for login
+    # 3. Final fallback: the termproxy transport itself failed (no ticket, no
+    # WebSocket upgrade, or a broken frame). That is not a credential problem,
+    # so do not send the operator down the password-escalation path.
     emit_output({
         "ok": False,
-        "status": "login_required",
-        "data": {"vmid": vmid, "node": node, "status": "login_required"},
-        "error": f"Container {vmid} console requires login credentials to establish in-guest access.",
-    }, args.format, title=f"LXC {vmid} Exec (login_required)")
-    return EXIT_AUTH
+        "status": "console_unavailable",
+        "data": {"vmid": vmid, "node": node, "status": "console_unavailable"},
+        "error": f"Could not establish a termproxy console session for container {vmid} on {node}.",
+    }, args.format, title=f"LXC {vmid} Exec (console_unavailable)")
+    return EXIT_INTERNAL
 
 
 def _resolve_guest_ip(node: str, vmid: str, kind: str | None, client: ProxmoxClient | None) -> str | None:
