@@ -1,15 +1,46 @@
 # AGENTS.md — Proxmox CLI Agent Guide
 
-This file is the operating guide for agents working on `proxmox-opencode-lab`.
+This file is the operating guide for agents working on `ProxBot`.
+
+## Current Repository Layout
+
+This checkout is organized as follows; keep documentation and changes aligned
+with these actual paths:
+
+```text
+ProxBot/
+├── chat.py                 # Chat assistant entry point
+├── scripts/
+│   ├── Proxmox-cli.py      # CLI entry point
+│   ├── Proxmox-console.py  # Console broker entry point
+│   ├── BUGS.md
+│   ├── IMPROVEMENTS.md
+│   └── logs/               # Runtime logs (gitignored)
+├── src/proxbot/
+│   ├── common/             # Configuration, API client, logging, safety
+│   ├── cli/                # Parser, dispatch, and command handlers
+│   ├── chat/               # Agent, tools, executor, approvals, session
+│   └── console/            # Broker, VNC protocol, and console commands
+├── tests/                  # Unit tests and static/equivalence checks
+├── plans/                  # Design and planning documents
+├── requirements.txt        # Python runtime dependencies
+├── .env.example            # Safe configuration template
+└── AGENTS.md / README.md   # Agent guide and human-facing overview
+```
+
+The three entry points above are thin shims; implementation belongs in
+`src/proxbot/`. Local `.env`, `.git.env`, generated keys, caches, and logs are
+not source files and must remain untracked. Python dependencies are declared in
+`requirements.txt` (`Pillow`, `requests`, `python-dotenv`).
 
 ## Skill Location
 
-This guide belongs to the local checkout at `/home/stephen/Scripts/9b-proxmox-manager/proxmox-manager`. When the user names this guide or checkout, use its CLI and `.env`; do not substitute the installed OpenCode copy.
+This guide belongs to the local checkout at `/home/svaye/Scripts/ProxBot`. When the user names this guide or checkout, use its CLI and `.env`; do not substitute the installed OpenCode copy.
 
 From any working directory, use this explicit prefix:
 
 ```bash
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env
 ```
 
 Never create, modify, overwrite, or relocate `.env` unless the user explicitly asks. If configuration is missing, report the path selected by `doctor`; never synthesize placeholder credentials.
@@ -34,7 +65,7 @@ Workflow** below before the first edit.
 ## Setup
 
 ```bash
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env doctor
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env doctor
 ```
 
 Add `--live` to `doctor` to explicitly request the live API connectivity test.
@@ -57,16 +88,16 @@ recovery — are in **Git Workflow** below and are mandatory for any code change
 ## Common Read-Only Commands
 
 ```bash
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env doctor
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env health
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env nodes list
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py node status --node <node>
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vms list --node <node>
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm status --node <node> --vmid 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm config --node <node> --vmid 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm guest-network --node <node> --vmid 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py storage list --node <node>
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py tasks recent --node <node>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env doctor
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env health
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env nodes list
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env node status --node <node>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vms list --node <node>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vm status --node <node> --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vm config --node <node> --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vm guest-network --node <node> --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env storage list --node <node>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env tasks recent --node <node>
 ```
 
 Always use the node returned by `nodes list`; names such as `pve1` are placeholders and may not exist.
@@ -77,26 +108,26 @@ Use these to discover IDs, networks, storage, and templates before creating reso
 
 ```bash
 # Next free VM/container ID
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vms next-id
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxcs next-id
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vms next-id
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxcs next-id
 
 # Networks (bridges, VLANs, physical interfaces)
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py network list --node <node>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env network list --node <node>
 
 # Storage and content
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py storage list --node <node>
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py storage content --node <node> --storage local
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env storage list --node <node>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env storage content --node <node> --storage local
 
 # LXC templates available on a storage pool
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py storage templates --node <node> --storage local
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env storage templates --node <node> --storage local
 
 # Download an LXC template from a URL (state-changing, dry-run by default)
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py storage template-download --node <node> --storage local \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env storage template-download --node <node> --storage local \
   --url https://example.com/debian-12-standard.tar.zst \
   --filename debian-12-standard.tar.zst
 
 # Print Debian 13 LXC console workaround for an existing container
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc fix-console --node <node> --vmid 109
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc fix-console --node <node> --vmid 109
 ```
 
 ## In-Container Command Execution
@@ -148,7 +179,7 @@ a password with `getpass`, cached in memory for the session and dropped by
 Confirm what is actually usable before relying on it:
 
 ```bash
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env doctor --live --node-access
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env doctor --live --node-access
 ```
 
 The probe runs `pct version` over node SSH per node and reports `usable` plus the
@@ -156,7 +187,7 @@ reason when it is not. `doctor` always reports which of the three transports are
 available.
 
 ```bash
-python3 /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/scripts/Proxmox-cli.py --env-file /home/stephen/Scripts/9b-proxmox-manager/proxmox-manager/.env lxc pct-exec --node <node> --vmid <id> --command "systemctl is-active nginx" --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc pct-exec --node <node> --vmid <id> --command "systemctl is-active nginx" --execute
 ```
 
 Rules the implementation enforces, and which new code must not weaken:
@@ -168,8 +199,8 @@ Rules the implementation enforces, and which new code must not weaken:
 - `vmid` is validated numeric at runtime as well as by argparse, because it is
   interpolated into the node command line.
 - A failing command reports its real exit code. It is never coerced to `0`.
-- `ProxmoxToolExecutor.execute()` refuses a `secret` for any tool outside
-  `HARNESS_ASSEMBLED_TOOLS`.
+- `ProxmoxToolExecutor.execute()` refuses secret channels except for explicitly
+  approved harness tools and `lxc_create` (root password passed over an FD).
 
 Node access is a real privilege increase. Prefer an unprivileged account scoped
 to the containers you need over `root`. `ssh exec` refuses Proxmox node targets
@@ -239,7 +270,7 @@ CLI use, prefer `--password-fd` so the password does not appear in process argv;
 read -rsp 'LXC root password: ' LXC_ROOT_PASSWORD; echo
 
 # Build a keyed base template from a stock Debian 13 tarball
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc create --node <node> --vmid 900 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc create --node <node> --vmid 900 \
   --hostname proxbot-base \
   --ostemplate local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst \
   --storage <store> \
@@ -248,7 +279,7 @@ python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc cre
   --as-template --execute --wait
 
 # Clone it; the key is inherited
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc clone --node <node> --vmid 900 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc clone --node <node> --vmid 900 \
   --new-vmid 901 --hostname my-container --execute --wait
 ```
 
@@ -258,10 +289,10 @@ Notes:
 
 ```bash
 # Generate a new Ed25519 key pair for a specific container
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc ssh-keygen --vmid 110 --keyfile ~/.ssh/lxc-110 --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc ssh-keygen --vmid 110 --keyfile ~/.ssh/lxc-110 --execute
 
 # Create an LXC container and inject an existing public key
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc create --node pve1 --vmid 110 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc create --node pve1 --vmid 110 \
   --hostname my-container \
   --ostemplate local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
   --storage local-lvm \
@@ -269,7 +300,7 @@ python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc cre
   --ssh-public-keys "ssh-ed25519 AAAAC3... user@host"
 
 # Create an LXC container and generate + inject a fresh key on the fly
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc create --node pve1 --vmid 110 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc create --node pve1 --vmid 110 \
   --hostname my-container \
   --ostemplate local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
   --storage local-lvm \
@@ -277,7 +308,7 @@ python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc cre
   --ssh-keygen --ssh-key-path ~/.ssh/lxc-110
 
 # Create an LXC container with Docker-friendly settings
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc create --node pve1 --vmid 110 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env lxc create --node pve1 --vmid 110 \
   --hostname docker-host \
   --ostemplate local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
   --storage local-lvm \
@@ -317,31 +348,31 @@ PROXMOX_CONSOLE_WATCH_INTERVAL=5.0
 Phase 1 commands:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py doctor
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py status --node <node> --vmid 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py screenshot --node <node> --vmid 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py read-text --node <node> --vmid 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py watch --node <node> --vmid 101 --until-stable --timeout 300
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py doctor
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py status --node <node> --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py screenshot --node <node> --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py read-text --node <node> --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py watch --node <node> --vmid 101 --until-stable --timeout 300
 ```
 
 Phase 2/3 commands:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py send-key --node <node> --vmid 101 --key Enter --execute
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py send-keys --node <node> --vmid 101 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py send-key --node <node> --vmid 101 --key Enter --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py send-keys --node <node> --vmid 101 \
   --keys "Space,Downx10,Space,Tab,Enter" --execute
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py mouse-move --node <node> --vmid 101 --x 100 --y 100 --execute
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py mouse-test --node <node> --vmid 101 --execute
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py run-command --node <node> --vmid 101 --command "ip addr" --execute
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py snapshot --node <node> --vmid 101 --name before-console --execute
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py type --node <node> --vmid 101 --text "systemctl status ssh" --execute --force --confirm 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py paste-text --node <node> --vmid 101 --text "systemctl status ssh" --execute --force --confirm 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py install-preset --node <node> --vmid 101 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py mouse-move --node <node> --vmid 101 --x 100 --y 100 --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py mouse-test --node <node> --vmid 101 --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py run-command --node <node> --vmid 101 --command "ip addr" --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py snapshot --node <node> --vmid 101 --name before-console --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py type --node <node> --vmid 101 --text "systemctl status ssh" --execute --force --confirm 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py paste-text --node <node> --vmid 101 --text "systemctl status ssh" --execute --force --confirm 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py install-preset --node <node> --vmid 101 \
   --preset debian-13-server-v1 --tasksel-focus-confirmed --execute --force --confirm 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py macro --node <node> --vmid 101 \
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py macro --node <node> --vmid 101 \
   --actions '[{"action":"key","key":"Enter"},{"action":"wait","seconds":1}]' --execute --force --confirm 101
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py session --node <node> --vmid 101 --list
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-console.py session --node <node> --vmid 101 --stop --session-id <id> --execute --force --confirm <id>
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py session --node <node> --vmid 101 --list
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-console.py session --node <node> --vmid 101 --stop --session-id <id> --execute --force --confirm <id>
 ```
 
 Console rules:
@@ -383,14 +414,14 @@ If the Proxmox host is virtualized or has hardware virtualization disabled, `/de
 Detect the situation:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py doctor
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env doctor
 # or on the Proxmox node directly: ls /dev/kvm
 ```
 
 If KVM is missing, set `kvm: 0` on the VM before starting:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py api post /nodes/pve1/qemu/101/config --data '{"kvm":"0"}' --execute
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env api post /nodes/pve1/qemu/101/config --data '{"kvm":"0"}' --execute
 ```
 
 Workflow adjustments for TCG VMs:
@@ -411,19 +442,19 @@ then `pct exec` if node access is configured, and the console only when
 Dry-run example:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm start --node pve1 --vmid 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vm start --node pve1 --vmid 101
 ```
 
 Real execution example:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm start --node pve1 --vmid 101 --execute --wait
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vm start --node pve1 --vmid 101 --execute --wait
 ```
 
 Dangerous execution example:
 
 ```bash
-python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm stop --node pve1 --vmid 101 --execute --force --confirm 101
+python3 /home/svaye/Scripts/ProxBot/scripts/Proxmox-cli.py --env-file /home/svaye/Scripts/ProxBot/.env vm stop --node pve1 --vmid 101 --execute --force --confirm 101
 ```
 
 Do not bypass safety guards.
