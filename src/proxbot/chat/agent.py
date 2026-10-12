@@ -37,14 +37,14 @@ Capabilities:
    - Tasks: tasks_recent
 2. Creating: You CAN and SHOULD create LXC containers and VMs when requested by the user.
    - Fresh LXC from OS tarball: check free IDs with `lxcs_next_id`, tarballs with `storage_templates` (or `templates_list`), pools with `storage_list` (choose one supporting 'LXC rootfs'), then call `lxc_create` with `ostemplate=<storage>:vztmpl/<file>.tar.*`. A root password is REQUIRED; the harness securely prompts the operator before execution. Do not ask the user to put a password in chat, and never invent or assume credentials. An SSH public key is optional but strongly recommended for reliable access. This password requirement does not apply to `lxc_clone`.
-   - New LXC from converted template (template:1 VMID, e.g. 20300): NEVER call `lxc_create` with the VMID as `ostemplate`. Call `lxc_clone` with `vmid=<template-vmid>`, `new_vmid=<free-id>`, `hostname`, `storage`.
+   - New LXC from converted template (template:1 VMID, e.g. 20300): NEVER call `lxc_create` with the VMID as `ostemplate`. Call `lxc_clone` with `vmid=<template-vmid>`, `new_vmid=<free-id>`, `hostname`. OMIT `storage` for the default linked clone — passing it fails with "parameter 'storage' not allowed for linked clones". Only pass `storage` for a full clone to a different pool; when unsure, read the template's `lxc_config` `rootfs` first, the clone inherits it.
    - New VM from VM template: NEVER call `vm_create`. Call `vm_clone` with `vmid=<template-vmid>`, `new_vmid=<free-id>`.
    - When asked to create a VM from scratch: check free IDs with `vms_next_id` and storage with `storage_list` (choose one supporting 'VM disks'), then call `vm_create`.
 3. In-Guest Command Execution & Configuration:
    - `vm_exec`: Run shell commands directly inside any running VM via the Proxmox QEMU Guest Agent REST API.
    - `lxc_exec`: Run shell commands directly inside any running LXC container via the Proxmox API (fast, works without SSH or network IP).
    - `ssh_exec`: Run shell commands over SSH on VMs, LXCs, or remote hosts.
-4. Managing: start, shutdown, reboot, snapshot, and delete VMs and LXCs.
+4. Managing: start, shutdown, reboot, snapshot, and delete VMs and LXCs. Update LXC config (static IP via net0, hostname, DNS) with `lxc_set_config` — `lxc_config` is read-only.
 
 Templates in Proxmox:
 • VM Templates: Full QEMU virtual machines converted to templates (`template: 1` in vms_list). Clone with `vm_clone` to create new VMs.
@@ -58,6 +58,8 @@ Guidelines:
 • For lxc_exec: call WITHOUT password/user args. If the container needs login, the harness securely prompts via getpass and retries. NEVER ask the user to paste a password into chat (it would persist in logs/history).
 • For ssh_exec: call WITHOUT password. On authentication failure the harness stops and prompts the operator for a corrected user, key file, or password, then retries once. NEVER retry the same failed credentials in a loop; wait for the operator.
 • Never call vm_guest_network on an LXC vmid — use lxc_status/lxc_config (LXCs have no qemu-server conf). If a tool fails with a type error, switch to the matching vm_* vs lxc_* tool instead of retrying.
+• `lxc_config` is READ-ONLY. To change anything (static IP via `net0`, hostname, DNS), call `lxc_set_config` — never call `lxc_config` twice expecting a change. Read `lxc_config` once, preserve bridge/firewall/type/hwaddr when rewriting `net0`, and set the container while stopped.
+• If a tool result says a call was suppressed or refused, do NOT retry the same call. Analyze the prior result, try a different tool or different arguments once, and if that also fails, stop and explain to the user.
 • Run ONE in-guest probe first (e.g. `cat /etc/os-release`) before firing parallel exec batches; exec can block 10-60s per call.
 • Present data in clean Markdown tables with column alignments.
 • Be direct, concise, and helpful.
@@ -365,6 +367,7 @@ Guidelines:
                     final_reply = accumulated_content
                     break
 
+                consecutive_suppressions = 0
                 for tc in tool_calls_list:
                     call_id = tc.get("id", f"call_{uuid.uuid4().hex[:8]}")
                     fn = tc.get("function", {})
@@ -385,6 +388,7 @@ Guidelines:
 
                     allowed, suppression_reason = self.watchdog.check_call(name, args)
                     if not allowed:
+                        consecutive_suppressions += 1
                         print(f"{YELLOW}! {suppression_reason}{RESET}")
                         tool_result_content = json.dumps({"ok": False, "error": suppression_reason})
                         self.messages.append({
@@ -393,7 +397,11 @@ Guidelines:
                             "name": name,
                             "content": tool_result_content,
                         })
+                        if consecutive_suppressions >= 2:
+                            print(f"{YELLOW}Stopping this turn: repeated suppressed calls. Analyze the prior results and explain to the user instead of retrying.{RESET}")
+                            break
                         continue
+                    consecutive_suppressions = 0
 
                     approved, auto_toggled = self.safety_gate.check_and_prompt(name, args)
                     if not approved:

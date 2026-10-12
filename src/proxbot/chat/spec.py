@@ -291,12 +291,31 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "lxc_config",
-            "description": "Retrieve configuration parameters for an LXC container.",
+            "description": "Retrieve configuration parameters for an LXC container. READ-ONLY: this cannot change anything — to set a static IP, hostname, or DNS, use lxc_set_config.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "node": {"type": "string", "description": "Node where the LXC is hosted."},
                     "vmid": {"type": "integer", "description": "LXC container ID."}
+                },
+                "required": ["node", "vmid"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lxc_set_config",
+            "description": "Update an LXC container's configuration, e.g. set a static IP via net0. Read the current config with lxc_config first and preserve bridge/firewall/type/hwaddr when rewriting net0 (only replace ip=dhcp with ip=<addr>/<cidr>). The container should be stopped. Prompts user for approval.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node where the LXC is hosted."},
+                    "vmid": {"type": "integer", "description": "LXC container ID."},
+                    "net0": {"type": "string", "description": "Full network interface string (e.g. name=eth0,bridge=vmbr0,firewall=1,ip=192.168.1.79/24,gw=192.168.1.1,type=veth)."},
+                    "hostname": {"type": "string", "description": "Container hostname."},
+                    "nameserver": {"type": "string", "description": "DNS server(s)."},
+                    "searchdomain": {"type": "string", "description": "DNS search domain."}
                 },
                 "required": ["node", "vmid"],
             },
@@ -719,7 +738,7 @@ READ_ONLY_TOOLS = {
     "storage_templates", "tasks_recent", "doctor", "health"
 }
 WRITE_TOOLS = {
-    "vm_create", "lxc_create", "vm_clone", "lxc_clone", "vm_start", "vm_shutdown", "vm_reboot",
+    "vm_create", "lxc_create", "vm_clone", "lxc_clone", "lxc_set_config", "vm_start", "vm_shutdown", "vm_reboot",
     "vm_snapshot_create", "lxc_start", "lxc_shutdown", "lxc_reboot",
     "lxc_snapshot_create", "storage_download", "templates_download", "vm_exec", "lxc_exec", "ssh_exec",
     "lxc_pct_exec",

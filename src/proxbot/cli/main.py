@@ -134,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_lxc_status(args, config, client, logger)
             if action == "config":
                 return cmd_lxc_config(args, config, client, logger)
+            if action == "set-config":
+                return cmd_lxc_set_config(args, config, client, logger)
             if action == "start":
                 return cmd_lxc_start(args, config, client, logger)
             if action == "shutdown":

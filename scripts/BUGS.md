@@ -21,6 +21,17 @@ Track bugs discovered while developing or using `scripts/Proxmox-cli.py`.
 
 Known open issues are listed below.
 
+### 2026-10-12 — Chat looped on read-only `lxc_config` when asked to set a static IP, then hit the turn limit
+
+- Status: fixed
+- Found by: human
+- Command: chat "create a lxc from the debain-template already created, set its ip to 192.168.1.79 ..."
+- Expected: Clone the template, set the static IP, start the container, SSH in, install nginx.
+- Actual: After a successful `lxc_clone`, the model called read-only `lxc_config` with identical arguments 6+ times (empty reasoning), hit duplicate-suppression and then "Maximum tool executions per turn (12)". `lxc_start`/SSH/nginx never attempted.
+- Suspected cause: No chat tool could write LXC config — `lxc_config` is GET-only, `lxc_clone` takes no `net0`, and the generic `api put` CLI path was not exposed to the model. The executor also silently drops extra args for `lxc_config`, so every retry collapsed to the same watchdog signature. The prompt additionally told the model to always pass `--storage` to `lxc_clone`, which fails for linked clones.
+- Fix notes: Added `lxc set-config` CLI (PUT `/nodes/{node}/lxc/{vmid}/config`, `--execute` guarded) and `lxc_set_config` chat tool; `lxc_config` documented read-only. Prompt now says to omit `--storage` for linked clones and to use `lxc_set_config` for IP/hostname/DNS. Agent loop now stops the turn after 2 consecutive suppressions instead of burning all 12 calls.
+- Related log file: `scripts/logs/chat-sessions/chat-20261012-085446-17f87b.jsonl`
+
 ### 2026-10-12 — Fresh LXC creation did not require guest credentials
 
 - Status: fixed
