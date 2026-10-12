@@ -22,7 +22,7 @@ ProxBot/
 │   ├── chat/               # Agent, tools, executor, approvals, session
 │   └── console/            # Broker, VNC protocol, and console commands
 ├── tests/                  # Unit tests and static/equivalence checks
-├── plans/                  # Design and planning documents
+├── plans/                  # project-history.md + agent-chat-loop.md reference
 ├── requirements.txt        # Python runtime dependencies
 ├── .env.example            # Safe configuration template
 └── AGENTS.md / README.md   # Agent guide and human-facing overview
@@ -461,7 +461,7 @@ Do not bypass safety guards.
 
 ## Prompt.md Compatibility
 
-For compatibility with the original `prompt.md` planning file, the CLI also accepts these deprecated flat aliases and `--yes` as an alias for `--execute` on write commands. New agent workflows must use the canonical nested commands returned by `commands --format json`.
+For compatibility with the original planning files (consolidated in `plans/project-history.md`), the CLI also accepts these deprecated flat aliases and `--yes` as an alias for `--execute` on write commands. New agent workflows must use the canonical nested commands returned by `commands --format json`.
 
 - `status` → `health`
 - `nodes` → `nodes list`

@@ -28,7 +28,7 @@ ProxBot/
 │   ├── chat/               # Chat loop, tool definitions, approvals, executor
 │   └── console/            # Console protocol, broker, and console commands
 ├── tests/                  # Unit tests and static checks
-├── plans/                  # Design notes and project plans
+├── plans/                  # project-history.md + agent-chat-loop.md reference
 ├── AGENTS.md               # Detailed operating and contribution guidance
 └── README.md               # This overview
 ```
