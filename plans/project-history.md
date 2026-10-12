@@ -1,18 +1,19 @@
 # ProxBot Project History
 
-Consolidated record of where ProxBot came from, what the original plans asked for, and what is actually implemented in this checkout. It replaces reading nine overlapping files in `plans/` for day-to-day work.
+Consolidated record of where ProxBot came from, what the original plans asked for, and what is actually implemented in this checkout. It replaces the eight overlapping plan files that used to live in `plans/` for day-to-day work.
 
-Source plans consolidated here (kept verbatim in `plans/` for archaeology):
+Source plans consolidated here (originals removed after consolidation; content preserved below in Timeline and Consolidated spec):
 
-- `plans/spec.md` — canonical CLI contract (v1 scope, safety, logging, tests).
-- `plans/prompt.md` — build loop and completion criteria ("Ralph loop").
-- `plans/implementation-plan.md` — phased build order (Phases 1–8).
-- `plans/proxmox-api-notes.md` — endpoint/auth/task notes plus Debian 13 console quirk.
-- `plans/Spec.md` — tool-constrained agent vision ("Proxmox operating system", tiers, policy layer).
-- `plans/chat-script-plan.md` — `chat.py` architecture, tool table, safety workflow, roadmap.
-- `plans/agent-chat-loop.md` — current chat loop reference (outer REPL + inner LLM loop).
-- `plans/console-access.md` — VNC console broker design (tiers, phases, acceptance criteria).
-- `plans/SKILL.md` — skill copy (capabilities, command sequences, policies).
+- `spec.md` — canonical CLI contract (v1 scope, safety, logging, tests).
+- `prompt.md` — build loop and completion criteria ("Ralph loop").
+- `implementation-plan.md` — phased build order (Phases 1–8).
+- `proxmox-api-notes.md` — endpoint/auth/task notes plus Debian 13 console quirk.
+- `Spec.md` — tool-constrained agent vision ("Proxmox operating system", tiers, policy layer).
+- `chat-script-plan.md` — `chat.py` architecture, tool table, safety workflow, roadmap.
+- `console-access.md` — VNC console broker design (tiers, phases, acceptance criteria).
+- `SKILL.md` — skill copy (capabilities, command sequences, policies).
+
+Still in `plans/` alongside this file: `agent-chat-loop.md`, kept as a live code reference because it maps the current chat loop to exact file/line locations.
 
 For live operator guidance use `AGENTS.md` (agent workflow) and `README.md` (human setup). For open defects use `scripts/BUGS.md`; for proposed work use `scripts/IMPROVEMENTS.md`.
 
