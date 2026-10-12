@@ -345,6 +345,25 @@ class ToolExecutorArgsTests(unittest.TestCase):
              "--template", "debian-13-standard_13.6-1_amd64.tar.zst", "--execute", "--wait"],
         )
 
+    def test_lxc_create_requires_password_and_sends_it_over_pipe(self):
+        missing = self.executor.execute("lxc_create", {"node": "pveheavy", "vmid": 109, "hostname": "newhost"})
+        self.assertFalse(missing["ok"])
+        self.assertIn("password is required", missing["error"])
+
+        args = {
+            "node": "pveheavy", "vmid": 109, "hostname": "newhost",
+            "ostemplate": "local:vztmpl/debian-13-standard.tar.zst", "storage": "SSDStore",
+            "ssh_keygen": False,
+        }
+        with mock.patch.object(self.executor, "_raw_execute", return_value={"ok": True}) as raw_execute:
+            result = self.executor.execute("lxc_create", args, secret="example-secret")
+        self.assertTrue(result["ok"])
+        cli_args = raw_execute.call_args.args[0]
+        self.assertNotIn("example-secret", cli_args)
+        self.assertNotIn("--password", cli_args)
+        self.assertEqual(raw_execute.call_args.kwargs["secret"], "example-secret")
+        self.assertEqual(raw_execute.call_args.kwargs["secret_fd_flag"], "--password-fd")
+
     def test_registry_tool_risk_classification(self):
         self.assertIn("templates_registry", chat.READ_ONLY_TOOLS)
         self.assertIn("templates_download", chat.WRITE_TOOLS)

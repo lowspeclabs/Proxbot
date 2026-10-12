@@ -193,6 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_create.add_argument("--features", default=None, help="LXC features (e.g., nesting=1). Omit to use default.")
     lxc_create.add_argument("--unprivileged", action=argparse.BooleanOptionalAction, default=True, help="Create an unprivileged container (default: True)")
     lxc_create.add_argument("--password", help="Root password")
+    lxc_create.add_argument("--password-fd", type=int, help="Read the root password from an inherited file descriptor (one line)")
     lxc_create.add_argument("--cores", type=int, help="Number of cores")
     lxc_create.add_argument("--memory", type=int, help="Memory in MB")
     lxc_create.add_argument("--swap", type=int, help="Swap in MB")

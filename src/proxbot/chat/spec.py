@@ -306,7 +306,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "lxc_create",
-            "description": "Create a new LXC container. Prompts user for approval.",
+            "description": "Create a new LXC container from an OS tarball. A root password is REQUIRED and the harness securely prompts for it before execution. Do not ask the user to type a password into chat and never invent or assume one. An SSH public key is optional but strongly recommended for reliable access. This requirement does not apply to lxc_clone.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -318,9 +318,8 @@ TOOLS_SPEC = [
                     "memory": {"type": "integer", "description": "Memory in MB (e.g. 1024)."},
                     "cores": {"type": "integer", "description": "Number of CPU cores."},
                     "net0": {"type": "string", "description": "Network configuration (e.g. name=eth0,bridge=vmbr0,ip=dhcp)."},
-                    "password": {"type": "string", "description": "Root password (optional)."},
                     "unprivileged": {"type": "boolean", "description": "Create unprivileged container (default true)."},
-                    "ssh_keygen": {"type": "boolean", "description": "Generate new SSH key pair and inject public key."}
+                    "ssh_keygen": {"type": "boolean", "description": "Optional but strongly recommended: generate an SSH key pair and inject its public key for reliable SSH access."}
                 },
                 "required": ["node", "hostname"],
             },

@@ -198,8 +198,6 @@ class ProxmoxToolExecutor:
                 cmd.extend(["--net0", str(net0)])
             else:
                 cmd.extend(["--net0", "name=eth0,bridge=vmbr0,ip=dhcp"])
-            if password:
-                cmd.extend(["--password", str(password)])
             if unprivileged is not None:
                 cmd.append("--unprivileged" if unprivileged else "--no-unprivileged")
             if ssh_keygen:
@@ -335,7 +333,12 @@ class ProxmoxToolExecutor:
                 idx += 1
         return docs
 
-    def _raw_execute(self, cli_args: List[str], secret: Optional[str] = None) -> Dict[str, Any]:
+    def _raw_execute(
+        self,
+        cli_args: List[str],
+        secret: Optional[str] = None,
+        secret_fd_flag: str = "--node-password-fd",
+    ) -> Dict[str, Any]:
         """Execute CLI command directly and parse JSON (stdout or stderr).
 
         `secret` is handed to the child on an inherited pipe file descriptor
@@ -362,7 +365,7 @@ class ProxmoxToolExecutor:
             else:
                 os.close(write_fd)
                 write_fd = None
-                full_cmd = full_cmd + ["--node-password-fd", str(read_fd)]
+                full_cmd = full_cmd + [secret_fd_flag, str(read_fd)]
 
         try:
             proc = subprocess.run(
@@ -533,8 +536,14 @@ class ProxmoxToolExecutor:
         except Exception as err:
             return {"ok": False, "error": f"Invalid tool arguments: {err}"}
 
-        # Only transports that accept the pipe channel may be handed a secret.
-        if secret is not None and tool_name not in HARNESS_ASSEMBLED_TOOLS:
+        # Only explicitly supported tools may receive secret data over the pipe.
+        if secret is not None and tool_name not in HARNESS_ASSEMBLED_TOOLS and tool_name != "lxc_create":
             return {"ok": False, "error": f"{tool_name} does not accept a secret channel."}
+
+        if tool_name == "lxc_create":
+            password = secret
+            if not isinstance(password, str) or not password:
+                return {"ok": False, "error": "A root password is required to create an LXC from an OS tarball. Collect it through the harness's secure prompt; do not request it in chat. An SSH public key is optional but strongly recommended."}
+            return self._raw_execute(cli_args, secret=password, secret_fd_flag="--password-fd")
 
         return self._raw_execute(cli_args, secret=secret)
