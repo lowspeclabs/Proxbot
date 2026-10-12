@@ -369,6 +369,25 @@ class ToolExecutorArgsTests(unittest.TestCase):
         self.assertIn("templates_download", chat.WRITE_TOOLS)
         self.assertNotIn("templates_download", chat.READ_ONLY_TOOLS)
 
+    def test_lxc_set_config_mapping(self):
+        self.assertEqual(
+            self.executor._build_cli_args("lxc_set_config", {"node": "pve1", "vmid": 110, "net0": "name=eth0,bridge=vmbr0,ip=192.168.1.79/24,gw=192.168.1.1,type=veth"}),
+            ["lxc", "set-config", "--node", "pve1", "--vmid", "110", "--execute",
+             "--net0", "name=eth0,bridge=vmbr0,ip=192.168.1.79/24,gw=192.168.1.1,type=veth"],
+        )
+        self.assertEqual(
+            self.executor._build_cli_args("lxc_set_config", {"node": "pve1", "vmid": 110, "hostname": "web"}),
+            ["lxc", "set-config", "--node", "pve1", "--vmid", "110", "--execute", "--hostname", "web"],
+        )
+
+    def test_lxc_set_config_requires_a_field(self):
+        with self.assertRaises(ValueError):
+            self.executor._build_cli_args("lxc_set_config", {"node": "pve1", "vmid": 110})
+
+    def test_lxc_set_config_risk_classification(self):
+        self.assertIn("lxc_set_config", chat.WRITE_TOOLS)
+        self.assertNotIn("lxc_set_config", chat.READ_ONLY_TOOLS)
+
 
 class NodePasswordPromptTests(unittest.TestCase):
     """The harness collects a node password once per session and keeps it out of argv."""

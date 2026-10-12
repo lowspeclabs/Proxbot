@@ -97,6 +97,16 @@ class ProxmoxToolExecutor:
             return ["lxc", "status", "--node", str(node), "--vmid", str(vmid)]
         elif tool_name == "lxc_config":
             return ["lxc", "config", "--node", str(node), "--vmid", str(vmid)]
+        elif tool_name == "lxc_set_config":
+            cmd = ["lxc", "set-config", "--node", str(node), "--vmid", str(vmid), "--execute"]
+            for key in ("net0", "hostname", "nameserver", "searchdomain"):
+                if args.get(key) is not None:
+                    cmd.extend([f"--{key}", str(args[key])])
+            if args.get("data"):
+                cmd.extend(["--data", str(args["data"])])
+            if not any(args.get(k) is not None for k in ("net0", "hostname", "nameserver", "searchdomain")) and not args.get("data"):
+                raise ValueError("lxc_set_config requires at least one of net0, hostname, nameserver, searchdomain, or data")
+            return cmd
         elif tool_name == "storage_list":
             cmd = ["storage", "list"]
             if node:

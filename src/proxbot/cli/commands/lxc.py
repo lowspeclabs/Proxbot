@@ -102,6 +102,67 @@ def cmd_lxc_config(args: argparse.Namespace, config: Config, client: ProxmoxClie
     return _exit_code_for(resp)
 
 
+def cmd_lxc_set_config(args: argparse.Namespace, config: Config, client: ProxmoxClient, logger: Logger) -> int:
+    """Update an LXC container's config (PUT), e.g. static IP via --net0."""
+    node = args.node or config.default_node
+    if not node:
+        emit_error("validation", "--node is required", "Set PROXMOX_DEFAULT_NODE or pass --node.", logger.file_path)
+        return EXIT_VALIDATION
+    vmid = str(args.vmid)
+    endpoint = f"/nodes/{node}/lxc/{vmid}/config"
+    body: dict[str, Any] = {}
+    for field in ("net0", "hostname", "nameserver", "searchdomain"):
+        value = getattr(args, field, None)
+        if value is not None:
+            body[field] = value
+    if getattr(args, "data", None):
+        try:
+            body.update(json.loads(args.data))
+        except json.JSONDecodeError:
+            emit_error("validation", "--data must be valid JSON", "", logger.file_path)
+            return EXIT_VALIDATION
+    if not body:
+        emit_error(
+            "validation",
+            "Nothing to update: pass at least one of --net0, --hostname, --nameserver, --searchdomain, or --data.",
+            "Read the current config with `lxc config` first; lxc config itself is read-only.",
+            logger.file_path,
+        )
+        return EXIT_VALIDATION
+
+    guard = require_execute(args, endpoint)
+    if guard is not None:
+        if guard.get("ok"):
+            return emit_dry_run(args, logger, request_plan("PUT", endpoint, body, {"node": node, "vmid": vmid}))
+        logger.log(
+            event="safety_guard",
+            argv=sys.argv[1:],
+            method="PUT",
+            endpoint=endpoint,
+            ok=guard.get("ok", True),
+            dry_run=True,
+            response_summary=guard.get("message", "blocked by safety guard"),
+        )
+        emit_output({"ok": guard.get("ok", True), "data": guard, "error": guard.get("error")}, args.format, title="Dry Run")
+        return EXIT_SAFETY if guard.get("ok") is False else EXIT_SUCCESS
+
+    resp = client.put(endpoint, body)
+    logger.log(
+        event="api_call",
+        argv=sys.argv[1:],
+        method="PUT",
+        endpoint=endpoint,
+        status_code=resp.get("status_code"),
+        duration_ms=resp.get("duration_ms"),
+        ok=resp["ok"],
+        response_summary=f"node={node} vmid={vmid} action=set-config",
+        error=resp.get("error"),
+    )
+    result = {"ok": resp["ok"], "data": resp.get("data"), "error": resp.get("error")}
+    emit_output(result, args.format, title=f"LXC {vmid} Config Updated")
+    return _exit_code_for(resp)
+
+
 def _lxc_state_change(
     args: argparse.Namespace,
     config: Config,

@@ -1199,6 +1199,71 @@ class AsTemplateTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class LxcSetConfigTests(unittest.TestCase):
+    """`lxc set-config` PUTs config changes (e.g. static IP); `lxc config` stays read-only."""
+
+    def _config(self):
+        return cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+
+    def _args(self, **extra):
+        base = dict(node="pve", vmid=110, net0=None, hostname=None,
+                     nameserver=None, searchdomain=None, data=None,
+                     execute=False, wait=False, wait_timeout=120, format="json")
+        base.update(extra)
+        return argparse.Namespace(**base)
+
+    def test_dry_run_emits_put_plan(self):
+        args = self._args(net0="name=eth0,bridge=vmbr0,firewall=1,ip=192.168.1.79/24,gw=192.168.1.1,type=veth")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_lxc_set_config(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["data"]["method"], "PUT")
+        self.assertEqual(result["data"]["endpoint"], "/nodes/pve/lxc/110/config")
+        self.assertIn("192.168.1.79", result["data"]["body"]["net0"])
+
+    def test_requires_at_least_one_field(self):
+        args = self._args()
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = cli.cmd_lxc_set_config(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_VALIDATION)
+
+    def test_rejects_invalid_data_json(self):
+        args = self._args(data="{not-json")
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = cli.cmd_lxc_set_config(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_VALIDATION)
+
+    def test_execute_puts_only_supplied_fields(self):
+        calls = []
+
+        class Client:
+            def put(self, endpoint, body):
+                calls.append((endpoint, body))
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": None, "error": None}
+
+        args = self._args(hostname="debian-server", execute=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            exit_code = cli.cmd_lxc_set_config(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertEqual(calls, [("/nodes/pve/lxc/110/config", {"hostname": "debian-server"})])
+
+    def test_parser_accepts_set_config_flags(self):
+        args = cli.build_parser().parse_args([
+            "lxc", "set-config", "--node", "pveheavy", "--vmid", "110",
+            "--net0", "name=eth0,bridge=vmbr0,ip=192.168.1.79/24,gw=192.168.1.1,type=veth",
+            "--execute",
+        ])
+        self.assertEqual(args.action, "set-config")
+        self.assertIn("192.168.1.79", args.net0)
+
+
 class TemplateRegistryTests(unittest.TestCase):
     def test_registry_parser_args(self):
         args = cli.build_parser().parse_args([

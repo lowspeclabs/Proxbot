@@ -162,7 +162,8 @@ def cmd_commands(args: argparse.Namespace, config: Config, client: ProxmoxClient
         {"command": "vms list", "write": False, "required": ["--node"], "optional": ["--status", "--limit"]},
         {"command": "lxcs list", "write": False, "required": ["--node"], "optional": ["--status", "--limit"]},
         {"command": "vm <status|config|guest-network>", "write": False, "required": ["--node", "--vmid"]},
-        {"command": "lxc <status|config>", "write": False, "required": ["--node", "--vmid"]},
+        {"command": "lxc <status|config>", "write": False, "required": ["--node", "--vmid"], "note": "lxc config is read-only; use lxc set-config to change anything."},
+        {"command": "lxc set-config", "write": True, "required": ["--node", "--vmid", "--execute", "--net0 OR --hostname OR --nameserver OR --searchdomain OR --data"], "note": "Update LXC config, e.g. static IP via --net0. Read lxc config first and preserve bridge/firewall/type/hwaddr when rewriting net0."},
         {"command": "storage <list|content|templates>", "write": False, "required": ["--node"]},
         {"command": "templates registry", "write": False, "required": ["--node"], "optional": ["--section", "--search", "--limit"], "note": "Browse upstream LXC template registry (pveam available)."},
         {"command": "templates download", "write": True, "required": ["--node", "--storage", "--template", "--execute"], "note": "Download a registry template by name (pveam download)."},
@@ -174,7 +175,7 @@ def cmd_commands(args: argparse.Namespace, config: Config, client: ProxmoxClient
         {"command": "vm|lxc <start|shutdown|reboot|snapshot create>", "write": True, "required": ["--execute"]},
         {"command": "lxc create", "write": True, "required": ["--node", "--vmid", "--hostname", "--ostemplate", "--storage", "--password OR --password-fd", "--execute"], "optional": ["--ssh-public-keys OR --ssh-keygen"], "note": "Password required for a fresh OS tarball; SSH key is optional but strongly recommended. Use lxc clone for converted templates."},
         {"command": "vm clone", "write": True, "required": ["--node", "--vmid <template-vmid>", "--new-vmid <id>", "--execute"], "note": "Clone a VM or VM template (pct clone)."},
-        {"command": "lxc clone", "write": True, "required": ["--node", "--vmid <template-vmid>", "--new-vmid <id>", "--execute"], "optional": ["--hostname", "--storage", "--pool", "--snapname"], "note": "Clone an LXC container or converted LXC template (template:1). Use this for template VMIDs; lxc create only accepts vztmpl tarballs."},
+        {"command": "lxc clone", "write": True, "required": ["--node", "--vmid <template-vmid>", "--new-vmid <id>", "--execute"], "optional": ["--hostname", "--storage", "--pool", "--snapname"], "note": "Clone an LXC container or converted LXC template (template:1). Use this for template VMIDs; lxc create only accepts vztmpl tarballs. Omit --storage for the default linked clone (passing it fails); only pass --storage for a full clone to a different pool."},
         {"command": "vm|lxc <stop|delete|snapshot delete>", "write": True, "required": ["--execute", "--force", "--confirm <vmid>"]},
         {"command": "api <get|post|put|delete> <endpoint>", "write": "method dependent", "required": ["--execute for POST/PUT", "--execute --force --confirm <endpoint> for DELETE"]},
     ]
