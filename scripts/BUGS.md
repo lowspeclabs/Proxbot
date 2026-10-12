@@ -21,6 +21,17 @@ Track bugs discovered while developing or using `scripts/Proxmox-cli.py`.
 
 Known open issues are listed below.
 
+### 2026-10-12 — Fresh LXC creation did not require guest credentials
+
+- Status: fixed
+- Found by: human
+- Command: chat `lxc_create` from a Debian OS tarball without a password or SSH key
+- Expected: Ask the operator for a root password before creation; recommend SSH public-key access.
+- Actual: The container was created with neither configured, leaving no known operator credential and SSH root authentication failed.
+- Suspected cause: Password was optional in the chat schema and CLI handler; the creation flow did not guard against its omission.
+- Fix notes: Chat instructions now require the harness's secure `getpass` prompt (not a password pasted into chat); executor passes the password over an inherited FD, and the CLI create handler rejects missing passwords. SSH key injection remains optional and is explicitly recommended. Clones are unaffected.
+- Related log file: `scripts/logs/chat-sessions/chat-20261012-063748-c6180b.jsonl`
+
 ### 2026-09-28 — `ssh exec` let the model reach a Proxmox node, bypassing every exec allowlist
 
 - Status: fixed

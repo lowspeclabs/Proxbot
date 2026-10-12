@@ -1104,7 +1104,7 @@ class AsTemplateTests(unittest.TestCase):
         base = dict(node="pve", vmid=90001, hostname="base", storage="local",
                     ostemplate="local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst",
                     ssh_public_keys="ssh-ed25519 AAAA test@host", ssh_keygen=False,
-                    unprivileged=True, features=None, password=None, cores=None, memory=None,
+                    unprivileged=True, features=None, password="test-root-password", password_fd=None, cores=None, memory=None,
                     swap=None, net0=None, rootfs=None, nameserver=None, onboot=None,
                     data=None, execute=True, wait=True, wait_timeout=60, as_template=True, format="json")
         base.update(extra)
@@ -1184,6 +1184,19 @@ class AsTemplateTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
         self.assertEqual(calls, ["/nodes/pve/lxc"])
+
+    def test_create_requires_password_before_api_call(self):
+        args = self._args(password=None)
+        calls = []
+
+        class Client:
+            def post(self, *args, **kwargs):
+                calls.append((args, kwargs))
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            code = cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_VALIDATION)
+        self.assertEqual(calls, [])
 
 
 class TemplateRegistryTests(unittest.TestCase):

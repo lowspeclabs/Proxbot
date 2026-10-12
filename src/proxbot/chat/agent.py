@@ -36,7 +36,7 @@ Capabilities:
    - Storage & Content: storage_list, storage_content, storage_templates
    - Tasks: tasks_recent
 2. Creating: You CAN and SHOULD create LXC containers and VMs when requested by the user.
-   - Fresh LXC from OS tarball: check free IDs with `lxcs_next_id`, tarballs with `storage_templates` (or `templates_list`), pools with `storage_list` (choose one supporting 'LXC rootfs'), then call `lxc_create` with `ostemplate=<storage>:vztmpl/<file>.tar.*`.
+   - Fresh LXC from OS tarball: check free IDs with `lxcs_next_id`, tarballs with `storage_templates` (or `templates_list`), pools with `storage_list` (choose one supporting 'LXC rootfs'), then call `lxc_create` with `ostemplate=<storage>:vztmpl/<file>.tar.*`. A root password is REQUIRED; the harness securely prompts the operator before execution. Do not ask the user to put a password in chat, and never invent or assume credentials. An SSH public key is optional but strongly recommended for reliable access. This password requirement does not apply to `lxc_clone`.
    - New LXC from converted template (template:1 VMID, e.g. 20300): NEVER call `lxc_create` with the VMID as `ostemplate`. Call `lxc_clone` with `vmid=<template-vmid>`, `new_vmid=<free-id>`, `hostname`, `storage`.
    - New VM from VM template: NEVER call `vm_create`. Call `vm_clone` with `vmid=<template-vmid>`, `new_vmid=<free-id>`.
    - When asked to create a VM from scratch: check free IDs with `vms_next_id` and storage with `storage_list` (choose one supporting 'VM disks'), then call `vm_create`.
@@ -414,14 +414,38 @@ Guidelines:
 
                     self.logger.stats["tool_approvals"] += 1
 
+                    create_secret: str | None = None
+                    if name == "lxc_create" and not args.get("password"):
+                        try:
+                            create_secret = getpass.getpass(
+                                f"  Root password for new LXC {args.get('hostname', '')} (Enter to cancel): "
+                            )
+                        except (EOFError, KeyboardInterrupt):
+                            create_secret = ""
+                        if not create_secret:
+                            result = {
+                                "ok": False,
+                                "status": "password_required",
+                                "error": "LXC creation cancelled: a root password is required. Do not ask the operator to paste it into chat.",
+                            }
+                            duration = 0.0
+                        else:
+                            result = None
+                    else:
+                        result = None
+
                     # Progress heartbeat: lxc/vm exec can block 10-60s (SSH probe +
                     # termproxy login). Print now so the UI doesn't look stuck.
                     if name in ("lxc_exec", "vm_exec", "ssh_exec"):
                         print(f"  {GRAY}running… (up to {args.get('timeout', 30)}s){RESET}", flush=True)
 
-                    t0 = time.time()
-                    result = self.executor.execute(name, args)
-                    duration = time.time() - t0
+                    if result is None:
+                        t0 = time.time()
+                        if create_secret is not None:
+                            result = self.executor.execute(name, args, secret=create_secret)
+                        else:
+                            result = self.executor.execute(name, args)
+                        duration = time.time() - t0
 
                     def _is_login_required(res: Dict[str, Any]) -> bool:
                         if res.get("status") == "login_required":

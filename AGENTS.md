@@ -225,12 +225,25 @@ from. Use `--as-template` to build such a base image; this is the recommended
 alternative to granting node SSH, because it removes the need for both a console
 login and `pct exec` for ordinary work.
 
+Creating a fresh LXC from an OS tarball **requires a root password**. If the
+user has not supplied one, the chat harness prompts securely with `getpass`
+before creation; never ask them to paste it into chat or invent/assume a
+credential. SSH public-key injection is optional but strongly recommended for
+reliable remote access. This requirement does not apply to `lxc clone`, which
+inherits the source container/template's account configuration. For interactive
+CLI use, prefer `--password-fd` so the password does not appear in process argv;
+`--password` remains available but is visible in the process table.
+
 ```bash
+# Read a password without echoing it; each create example below passes it on FD 3.
+read -rsp 'LXC root password: ' LXC_ROOT_PASSWORD; echo
+
 # Build a keyed base template from a stock Debian 13 tarball
 python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc create --node <node> --vmid 900 \
   --hostname proxbot-base \
   --ostemplate local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst \
   --storage <store> \
+  --password-fd 3 3<<<"$LXC_ROOT_PASSWORD" \
   --ssh-public-keys "$(cat ~/.ssh/lxc-base.pub)" \
   --as-template --execute --wait
 
@@ -252,6 +265,7 @@ python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc cre
   --hostname my-container \
   --ostemplate local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
   --storage local-lvm \
+  --password-fd 3 3<<<"$LXC_ROOT_PASSWORD" \
   --ssh-public-keys "ssh-ed25519 AAAAC3... user@host"
 
 # Create an LXC container and generate + inject a fresh key on the fly
@@ -259,6 +273,7 @@ python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc cre
   --hostname my-container \
   --ostemplate local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
   --storage local-lvm \
+  --password-fd 3 3<<<"$LXC_ROOT_PASSWORD" \
   --ssh-keygen --ssh-key-path ~/.ssh/lxc-110
 
 # Create an LXC container with Docker-friendly settings
@@ -266,6 +281,7 @@ python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc cre
   --hostname docker-host \
   --ostemplate local:vztmpl/debian-13-standard_13.1-2_amd64.tar.zst \
   --storage local-lvm \
+  --password-fd 3 3<<<"$LXC_ROOT_PASSWORD" \
   --rootfs local-lvm:16 \
   --features nesting=1 \
   --unprivileged \

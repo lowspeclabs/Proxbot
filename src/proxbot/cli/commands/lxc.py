@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -224,6 +225,24 @@ def cmd_lxc_create(args: argparse.Namespace, config: Config, client: ProxmoxClie
     vmid = str(args.vmid)
     endpoint = f"/nodes/{node}/lxc"
 
+    password = getattr(args, "password", None)
+    password_fd = getattr(args, "password_fd", None)
+    if password_fd is not None:
+        try:
+            with os.fdopen(os.dup(password_fd), "r", encoding="utf-8") as password_pipe:
+                password = password_pipe.readline(4097).rstrip("\r\n")
+        except (OSError, ValueError) as exc:
+            emit_error("validation", f"Could not read --password-fd: {exc}", "Pass the password through an inherited readable file descriptor.", logger.file_path)
+            return EXIT_VALIDATION
+    if not password:
+        emit_error(
+            "validation",
+            "A root password is required when creating an LXC from an OS tarball.",
+            "Supply --password (visible in the process table) or use --password-fd. SSH public-key injection is optional but strongly recommended.",
+            logger.file_path,
+        )
+        return EXIT_VALIDATION
+
     ostemplate_err = _validate_ostemplate(getattr(args, "ostemplate", None))
     if ostemplate_err:
         emit_error("validation", ostemplate_err, "Run `storage templates --node <node> --storage local` for valid vztmpl volids.", logger.file_path)
@@ -243,8 +262,7 @@ def cmd_lxc_create(args: argparse.Namespace, config: Config, client: ProxmoxClie
         body["features"] = features_val
     if getattr(args, "unprivileged", None) is not None:
         body["unprivileged"] = 1 if args.unprivileged else 0
-    if getattr(args, "password", None):
-        body["password"] = args.password
+    body["password"] = password
     if getattr(args, "cores", None) is not None:
         body["cores"] = args.cores
     if getattr(args, "memory", None) is not None:
