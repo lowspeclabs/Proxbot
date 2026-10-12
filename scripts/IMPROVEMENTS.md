@@ -2,6 +2,15 @@
 
 Track proposed improvements while developing or using `scripts/Proxmox-cli.py`.
 
+## 2026-10-12 — Fresh per-request cluster snapshot + `cluster_summary` tool
+
+- Status: implemented
+- Area: chat | api | tests
+- Reason: The model burned discovery calls and guessed wrong pool names (e.g. `local-lvm`, which does not exist on `pveheavy`) because it had no cheap view of cluster facts.
+- Suggested change: Added an executor-aggregated read-only `cluster_summary` tool (nodes, next free ID, storage pools with content types, bridges, LXC/VM placement — same pattern as `templates_list`, no single CLI command) and a fresh snapshot system message injected at every `chat()` start. The previous snapshot is dropped first so the model never acts on stale placement/IDs; a failed fetch means no snapshot, never a stale one. Storage rows dedupe shared pools across nodes but keep node-local pools per node. Prompt tells the model to trust the snapshot for names/pools/bridges/IDs and re-verify with a live tool before mutating.
+- Tradeoffs: Each prompt costs ~4s of read-only API calls up front; the snapshot adds ~6KB to context. Executor-side guards (e.g. linked-clone `--storage`) are still needed — facts alone do not prevent semantic errors.
+- Related files: `src/proxbot/chat/spec.py`, `src/proxbot/chat/executor.py`, `src/proxbot/chat/agent.py`, `tests/test_chat.py`
+
 ## 2026-09-19 — VM in-guest command execution via QEMU Guest Agent API (`vm exec`) & Agent Diagnostics
 
 - Status: implemented

@@ -21,6 +21,19 @@ from .spec import READ_ONLY_TOOLS, TOOLS_SPEC
 from .streamer import RollingThoughtStreamer
 from .watchdog import LoopWatchdog, extract_embedded_tool_calls
 
+# Prefix marking the auto-injected per-request cluster snapshot. The previous
+# snapshot is dropped at the start of every chat() call so the model never
+# acts on stale placement, pools, or IDs.
+_CLUSTER_SNAPSHOT_PREFIX = "[Cluster snapshot"
+
+
+def _is_cluster_snapshot_message(msg: Dict[str, Any]) -> bool:
+    return (
+        msg.get("role") == "system"
+        and isinstance(msg.get("content"), str)
+        and msg["content"].startswith(_CLUSTER_SNAPSHOT_PREFIX)
+    )
+
 class ChatAgent:
     """Autonomous agent orchestrating LLM conversation, tool calls, and execution."""
 
@@ -32,6 +45,7 @@ Capabilities:
    - Nodes: nodes_list, node_status
    - VMs & VM Templates: vms_list, vm_status, vm_config, vm_guest_network
    - LXCs & CT Templates: lxcs_list, lxc_status, lxc_config
+   - Cluster overview (fresh each request): cluster_summary — nodes, storage pools, bridges, placement, next free ID. A snapshot is also injected automatically; prefer it over re-listing.
    - Templates (VMs, LXCs, OS tarballs): templates_list
    - Storage & Content: storage_list, storage_content, storage_templates
    - Tasks: tasks_recent
@@ -60,6 +74,7 @@ Guidelines:
 • Never call vm_guest_network on an LXC vmid — use lxc_status/lxc_config (LXCs have no qemu-server conf). If a tool fails with a type error, switch to the matching vm_* vs lxc_* tool instead of retrying.
 • `lxc_config` is READ-ONLY. To change anything (static IP via `net0`, hostname, DNS), call `lxc_set_config` — never call `lxc_config` twice expecting a change. Read `lxc_config` once, preserve bridge/firewall/type/hwaddr when rewriting `net0`, and set the container while stopped.
 • If a tool result says a call was suppressed or refused, do NOT retry the same call. Analyze the prior result, try a different tool or different arguments once, and if that also fails, stop and explain to the user.
+• A fresh `[Cluster snapshot ...]` system message is injected with every request. Trust it for storage-pool names, bridges, container placement, and free IDs instead of spending discovery calls — but re-verify with a live tool (e.g. `lxc_config` before `lxc_set_config`) right before mutating anything, since state may have changed mid-task.
 • Run ONE in-guest probe first (e.g. `cat /etc/os-release`) before firing parallel exec batches; exec can block 10-60s per call.
 • Present data in clean Markdown tables with column alignments.
 • Be direct, concise, and helpful.
@@ -220,6 +235,32 @@ Guidelines:
         self.logger.log("USER", {"content": user_input})
         self.logger.stats["user_prompts"] += 1
         self.watchdog.reset_turn()
+
+        # Fresh per-request cluster snapshot (pools, bridges, placement, free
+        # IDs) so the model does not burn discovery calls or guess names like
+        # `local-lvm`. The previous snapshot is dropped first; a failed fetch
+        # simply means no snapshot this turn, never a stale one.
+        self.messages = [m for m in self.messages if not _is_cluster_snapshot_message(m)]
+        try:
+            snapshot = self.executor.execute("cluster_summary", {})
+        except Exception as exc:
+            snapshot = {"ok": False, "error": str(exc)}
+        if isinstance(snapshot, dict) and snapshot.get("ok") and isinstance(snapshot.get("data"), dict):
+            try:
+                snapshot_body = json.dumps(snapshot["data"], ensure_ascii=False)
+            except (TypeError, ValueError):
+                snapshot_body = ""
+            if snapshot_body:
+                if len(snapshot_body) > 12000:
+                    snapshot_body = snapshot_body[:12000] + "... [truncated]"
+                taken = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                self.messages.append({"role": "system", "content": (
+                    f"{_CLUSTER_SNAPSHOT_PREFIX} taken {taken} — fresh cluster facts "
+                    "(nodes, storage pools, bridges, LXC/VM placement, next free ID). "
+                    "Trust it for pool/bridge/placement/ID choices instead of re-listing, "
+                    "but re-verify with a live tool right before any mutating call.]\n"
+                    + snapshot_body
+                )})
 
         turn = 0
         final_reply = ""

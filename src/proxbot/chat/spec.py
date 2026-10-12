@@ -641,6 +641,23 @@ TOOLS_SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "cluster_summary",
+            "description": "Get a fresh compact overview of the cluster: nodes, storage pools with content types, network bridges, LXC/VM placement, and the next free VMID. Read-only. Prefer this over separate nodes_list/storage_list/lxcs_list calls at the start of a task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Limit the summary to one node (optional)."
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "templates_registry",
             "description": "Browse the upstream LXC template registry (pveam available). Use this when the user wants to find or download a container template that is not already cached on local storage.",
             "parameters": {
@@ -733,7 +750,7 @@ TOOLS_SPEC = [
 # Classification of risk levels
 READ_ONLY_TOOLS = {
     "nodes_list", "node_status", "resolve_vmid", "vms_list", "vms_next_id",
-    "lxcs_list", "lxcs_next_id", "templates_list", "templates_registry", "vm_status", "vm_config", "vm_guest_network",
+    "lxcs_list", "lxcs_next_id", "templates_list", "templates_registry", "cluster_summary", "vm_status", "vm_config", "vm_guest_network",
     "lxc_status", "lxc_config", "storage_list", "storage_content",
     "storage_templates", "tasks_recent", "doctor", "health"
 }
