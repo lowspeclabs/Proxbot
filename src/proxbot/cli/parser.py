@@ -110,6 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--kind", choices=["vm", "lxc"], help="Expected resource type")
     doctor = _cmd(sub.add_parser("doctor", help="Check config and API connectivity"))
     doctor.add_argument("--live", action="store_true", help="Run a live API connectivity test")
+    doctor.add_argument("--node-access", action="store_true", help="Also probe node SSH and report whether pct exec is usable (implies a live check)")
     _cmd(sub.add_parser("health", help="Show Proxmox health summary"))
 
     # Nodes
@@ -203,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_create.add_argument("--ssh-keygen", action="store_true", help="Generate a new SSH key pair and inject the public key")
     lxc_create.add_argument("--ssh-key-path", help="Path to save generated SSH key (default: ./.lxc-ssh-key-<VMID>)")
     lxc_create.add_argument("--data", help="JSON body for extra parameters")
+    lxc_create.add_argument("--as-template", action="store_true", help="Convert the new container to a template after creation (for building a keyed base image that clones inherit)")
     lxc_clone = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("clone", help="Clone LXC or converted LXC template (requires --execute)")))
     lxc_clone.add_argument("--new-vmid", type=int, required=True, help="New container ID (use lxcs next-id)")
     lxc_clone.add_argument("--hostname", help="Hostname for the clone")
@@ -217,7 +219,12 @@ def build_parser() -> argparse.ArgumentParser:
     lxc_exec.add_argument("--password", help="Password for container console login")
     lxc_exec.add_argument("--key-file", help="SSH private key path for key injection / fallback")
     lxc_exec.add_argument("--no-auto-inject-key", action="store_true", help="Do not automatically inject SSH key after console login")
+    lxc_exec.add_argument("--console", action="store_true", help="Allow fallback to the container console (termproxy). The console is a single shared pty, so only pass this when you have confirmed no other session is attached.")
     lxc_delete = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("delete", help="Delete LXC (requires --execute --force --confirm)")), destructive=True)
+    lxc_pct_exec = _write_cmd(_add_node_vmid_args(lxc_sub.add_parser("pct-exec", help="Run a command inside an LXC via the node (pct exec over SSH; requires --execute)")))
+    lxc_pct_exec.add_argument("--command", required=True, help="Shell command to run inside the container")
+    lxc_pct_exec.add_argument("--node-password", help="Password for node SSH. Visible in the process table to other local users; prefer --node-password-fd or PROXMOX_NODE_SSH_KEY.")
+    lxc_pct_exec.add_argument("--node-password-fd", type=int, help="Read the node SSH password from this inherited file descriptor (one line). Keeps the secret out of argv and the environment.")
     lxc_fix_console = _cmd(_add_node_vmid_args(lxc_sub.add_parser("fix-console", help="Print Debian 13 LXC console workaround")))
     lxc_fix_console.add_argument("--ostemplate", help="OS template (if not stored in config)")
 
@@ -239,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     ssh_exec.add_argument("--user", default="root", help="SSH user (default: root)")
     ssh_exec.add_argument("--port", type=int, default=22, help="SSH port (default: 22)")
     ssh_exec.add_argument("--key-file", "-i", help="Path to SSH private key")
+    ssh_exec.add_argument("--password", help="SSH password (prefer key auth; visible in process table, redacted in logs)")
 
     lxc_snapshot = lxc_sub.add_parser("snapshot", help="LXC snapshot commands")
     lxc_snapshot_sub = lxc_snapshot.add_subparsers(dest="snapshot_action", required=True)

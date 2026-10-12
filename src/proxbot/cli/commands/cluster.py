@@ -31,6 +31,8 @@ from ._shared import _exit_code_for, _extract_task, _require_config, _wait_for_t
 
 
 def cmd_doctor(args: argparse.Namespace, config: Config, client: ProxmoxClient, logger: Logger) -> int:
+    from .nodessh import probe_node_ssh
+
     data: dict[str, Any] = {
         ".env_path": str(config.env_path),
         ".env_found": config.env_path.exists(),
@@ -40,13 +42,29 @@ def cmd_doctor(args: argparse.Namespace, config: Config, client: ProxmoxClient, 
         "ssl_verification": "enabled" if config.verify_ssl else "disabled (WARNING)",
         "log_directory": str(config.log_dir),
     }
+
+    # Exec transports, reported whether or not the API is reachable. The
+    # operator needs to know which of the three exec paths are available before
+    # asking the agent to run anything.
+    data["exec_transports"] = {
+        "ssh_guest": "available when the guest has a resolvable IP and an installed key",
+        "pct_exec": "available" if config.node_ssh_configured else "unavailable (not configured)",
+        "console": "opt-in only (--console); shared pty, never used automatically",
+    }
+    if not config.node_ssh_configured:
+        data["node_ssh"] = {
+            "configured": False,
+            "missing": config.node_ssh_missing(),
+            "hint": "Set PROXMOX_NODE_SSH_USER and PROXMOX_NODE_SSH_KEY, then run `doctor --live`.",
+        }
+
     if not config.ok:
         data["config_status"] = "missing required values: " + ", ".join(config.missing())
         result = {"ok": False, "error_type": "config", "data": data, "error": data["config_status"]}
         emit_output(result, args.format, title="Doctor")
         return EXIT_CONFIG
 
-    if not args.live:
+    if not args.live and not args.node_access:
         data["api_connectivity"] = "not checked (pass --live)"
         result = {"ok": True, "data": data, "error": None}
         emit_output(result, args.format, title="Doctor")
@@ -58,6 +76,26 @@ def cmd_doctor(args: argparse.Namespace, config: Config, client: ProxmoxClient, 
     data["api_connectivity"] = "ok" if resp["ok"] else "failed"
     version_data = resp.get("data") or {}
     summary = f"version={version_data.get('version', 'unknown')}"
+
+    # Confirm node SSH / pct exec per node, and record which transports the
+    # agent will actually have. This is the gate: pct exec stays unusable until
+    # this probe succeeds, and the result is what the operator acts on.
+    if args.node_access:
+        probes = []
+        requested_node = getattr(args, "node", None)
+        if requested_node:
+            probe_nodes = [requested_node]
+        else:
+            nodes_resp = client.get("/nodes")
+            probe_nodes = [
+                entry.get("node") for entry in (nodes_resp.get("data") or [])
+                if isinstance(entry, dict) and entry.get("node")
+            ] if nodes_resp.get("ok") else []
+        for name in probe_nodes:
+            probes.append(probe_node_ssh(name, config, client))
+        data["node_access"] = probes
+        data["pct_exec_available"] = any(p.get("usable") for p in probes)
+
     if not resp["ok"]:
         data["error"] = str(resp.get("error", "unknown"))
     logger.log(

@@ -166,6 +166,114 @@ class LoopWatchdogTests(unittest.TestCase):
         self.assertIn("Maximum tool executions per turn", reason)
 
 
+class HarnessCommandValidationTests(unittest.TestCase):
+    """The model may only ask for the command the harness would assemble itself."""
+
+    def _ok(self, args):
+        allowed, reason = chat.validate_harness_command("lxc_pct_exec", args)
+        self.assertTrue(allowed, reason)
+
+    def _refused(self, args, needle=None):
+        allowed, reason = chat.validate_harness_command("lxc_pct_exec", args)
+        self.assertFalse(allowed)
+        if needle:
+            self.assertIn(needle, reason)
+
+    # --- accepted shapes -------------------------------------------------
+    def test_accepts_minimal_call(self):
+        self._ok({"vmid": 170, "command": "systemctl status nginx"})
+
+    def test_accepts_node_and_timeout(self):
+        self._ok({"vmid": 170, "command": "id", "node": "pveheavy", "timeout": 60})
+
+    def test_accepts_numeric_string_vmid(self):
+        self._ok({"vmid": "170", "command": "id"})
+
+    # --- refused: attempts to steer the harness --------------------------
+    def test_refuses_injected_host(self):
+        self._refused({"vmid": 170, "command": "id", "host": "attacker.example"}, "does not accept host")
+
+    def test_refuses_injected_user(self):
+        self._refused({"vmid": 170, "command": "id", "user": "root"}, "does not accept user")
+
+    def test_refuses_arbitrary_shell(self):
+        self._refused({"vmid": 170, "command": "id", "shell": "/bin/bash"}, "does not accept shell")
+
+    def test_refuses_arbitrary_remote_argv(self):
+        self._refused({"vmid": 170, "command": "id", "remote": "rm -rf /"}, "does not accept remote")
+
+    def test_refuses_non_numeric_vmid(self):
+        self._refused({"vmid": "170; rm -rf /", "command": "id"}, "numeric vmid")
+
+    def test_refuses_boolean_vmid(self):
+        # bool is an int subclass; True must not become vmid 1.
+        self._refused({"vmid": True, "command": "id"}, "integer vmid")
+
+    def test_refuses_empty_command(self):
+        self._refused({"vmid": 170, "command": "   "}, "non-empty string command")
+
+    def test_refuses_non_string_command(self):
+        self._refused({"vmid": 170, "command": ["rm", "-rf", "/"]}, "non-empty string command")
+
+    def test_refuses_command_that_starts_with_pct(self):
+        # Guards against the model treating this as a node shell, which would
+        # otherwise surface as a confusing "command not found" in the guest.
+        self._refused({"vmid": 170, "command": "pct exec 200 -- id"}, "starts with `pct`")
+        self._refused({"vmid": 170, "command": "  /usr/sbin/pct status"}, "starts with `pct`")
+
+    def test_allows_pct_appearing_inside_a_real_command(self):
+        # Must not be a naive substring match: these are legitimate guest
+        # commands that merely mention pct.
+        self._ok({"vmid": 170, "command": "cat /etc/pct.conf 2>/dev/null"})
+        self._ok({"vmid": 170, "command": "ls /usr/bin | grep -c pct"})
+        self._ok({"vmid": 170, "command": "echo impacted; df -h"})
+
+    def test_ignores_other_tools(self):
+        allowed, _ = chat.validate_harness_command("ssh_exec", {"host": "10.0.0.5", "command": "id"})
+        self.assertTrue(allowed)
+
+    # --- enforcement actually happens in the watchdog --------------------
+    def test_watchdog_blocks_before_the_approval_prompt(self):
+        dog = chat.LoopWatchdog()
+        allowed, reason = dog.check_call("lxc_pct_exec", {"vmid": 170, "command": "id", "host": "x"})
+        self.assertFalse(allowed)
+        self.assertIn("does not accept", reason)
+        # Blocked calls must not consume the per-turn budget, so a rejected
+        # attempt cannot be used to exhaust the turn and mask a later one.
+        self.assertEqual(dog.total_calls_in_turn, 0)
+
+    def test_watchdog_allows_a_wellformed_call(self):
+        dog = chat.LoopWatchdog()
+        allowed, reason = dog.check_call("lxc_pct_exec", {"vmid": 170, "command": "id"})
+        self.assertTrue(allowed, reason)
+        self.assertEqual(dog.total_calls_in_turn, 1)
+
+    def test_executor_refuses_even_when_called_directly(self):
+        # Bypassing agent.py must not bypass validation.
+        executor = chat.ProxmoxToolExecutor(pathlib.Path("/nonexistent/cli.py"), pathlib.Path("/nonexistent/.env"))
+        result = executor.execute("lxc_pct_exec", {"vmid": 170, "command": "id", "host": "attacker"})
+        self.assertFalse(result["ok"])
+        self.assertIn("does not accept", result["error"])
+
+    def test_executor_builds_the_expected_argv(self):
+        executor = chat.ProxmoxToolExecutor(pathlib.Path("/nonexistent/cli.py"), pathlib.Path("/nonexistent/.env"))
+        argv = executor._build_cli_args("lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy", "timeout": 45})
+        self.assertEqual(argv, [
+            "lxc", "pct-exec", "--vmid", "170", "--command", "id",
+            "--execute", "--node", "pveheavy", "--request-timeout", "45",
+        ])
+        # The model cannot inject a shell or an extra flag into the argv.
+        self.assertNotIn("--host", argv)
+        self.assertNotIn("--shell", argv)
+
+    def test_tool_is_advertised_to_the_model(self):
+        from proxbot.chat import spec as spec_mod
+        names = {t["function"]["name"] for t in spec_mod.TOOLS_SPEC}
+        self.assertIn("lxc_pct_exec", names)
+        self.assertIn("lxc_pct_exec", chat.WRITE_TOOLS)
+        self.assertIn("lxc_pct_exec", chat.HARNESS_ASSEMBLED_TOOLS)
+
+
 class SafetyGateTests(unittest.TestCase):
     def test_read_only_tools_pass(self):
         gate = chat.SafetyGate(auto_approve=False)
@@ -241,6 +349,168 @@ class ToolExecutorArgsTests(unittest.TestCase):
         self.assertIn("templates_registry", chat.READ_ONLY_TOOLS)
         self.assertIn("templates_download", chat.WRITE_TOOLS)
         self.assertNotIn("templates_download", chat.READ_ONLY_TOOLS)
+
+
+class NodePasswordPromptTests(unittest.TestCase):
+    """The harness collects a node password once per session and keeps it out of argv."""
+
+    def _agent(self, executor, tmpdir):
+        logger = chat.SessionLogger(pathlib.Path(tmpdir))
+        return chat.ChatAgent(
+            base_url="http://mock-llm:1234/v1",
+            api_key="k", model="m", temperature=0.1, max_turns=3,
+            executor=executor, safety_gate=chat.SafetyGate(auto_approve=True),
+            logger=logger,
+        )
+
+    def _stream(self, tool_name, arguments, answer="done"):
+        tool = json.dumps({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "c1", "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps(arguments)},
+        }]}}]})
+        done = json.dumps({"choices": [{"delta": {"content": answer}}]})
+        def _resp(payload):
+            r = mock.MagicMock()
+            r.status_code = 200
+            r.iter_lines.return_value = [f"data: {payload}".encode(), b"data: [DONE]"]
+            return r
+        return [_resp(tool), _resp(done)]
+
+    def test_prompts_once_and_retries_with_the_secret(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.side_effect = [
+                {"ok": False, "status": "node_password_required",
+                 "data": {"user": "root"}, "error": "needs a password"},
+                {"ok": True, "data": {"exit_code": 0, "stdout": "hello\n"}},
+            ]
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value="node-secret") as prompt:
+                    agent.chat("run id")
+
+            prompt.assert_called_once()
+            self.assertIn("root@pveheavy", prompt.call_args[0][0])
+            self.assertEqual(executor.execute.call_count, 2)
+            # The secret travels on the dedicated channel, never in arguments.
+            retry = executor.execute.call_args_list[1]
+            self.assertEqual(retry.kwargs.get("secret"), "node-secret")
+            self.assertNotIn("node-secret", json.dumps(retry.args[1]))
+
+    def test_second_call_reuses_the_cached_password_without_prompting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.return_value = {
+                "ok": False, "status": "node_password_required",
+                "data": {"user": "root"}, "error": "needs a password",
+            }
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value="node-secret") as prompt:
+                    agent.chat("run id")
+                    agent.chat("run id again")
+            self.assertEqual(prompt.call_count, 1)
+            self.assertEqual(agent._node_prompts.get("pveheavy"), "node-secret")
+
+    def test_cancelled_prompt_does_not_retry_and_does_not_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.return_value = {
+                "ok": False, "status": "node_password_required",
+                "data": {"user": "root"}, "error": "needs a password",
+            }
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value=""):
+                    agent.chat("run id")
+            self.assertEqual(executor.execute.call_count, 1)
+            self.assertEqual(agent._node_prompts, {})
+
+    def test_clear_history_drops_the_cached_password(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._agent(mock.MagicMock(), tmpdir)
+            agent._node_prompts["pveheavy"] = "node-secret"
+            agent.clear_history()
+            self.assertEqual(agent._node_prompts, {})
+
+    def test_other_tools_never_prompt_for_a_node_password(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            executor = mock.MagicMock()
+            executor.execute.return_value = {
+                "ok": False, "status": "login_required",
+                "data": {"user": "root"}, "error": "console login required",
+            }
+            agent = self._agent(executor, tmpdir)
+            with mock.patch("chat.requests.post", side_effect=self._stream(
+                "lxc_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
+                with mock.patch("getpass.getpass", return_value="") as prompt:
+                    agent.chat("run id")
+            # lxc_exec's own console escalation is separate; it must not be
+            # handed a node secret, and no retry may happen when cancelled.
+            self.assertEqual(executor.execute.call_count, 1)
+
+
+class BenignNoticeTests(unittest.TestCase):
+    """Routine ssh(1) chatter must not be rendered as a failure."""
+
+    def _agent(self, tmpdir="."):
+        return chat.ChatAgent(
+            base_url="http://mock-llm:1234/v1", api_key="k", model="m",
+            temperature=0.1, max_turns=3, executor=mock.MagicMock(),
+            safety_gate=chat.SafetyGate(auto_approve=True),
+            logger=chat.SessionLogger(pathlib.Path(tmpdir)),
+        )
+
+    NOTICE = ("Warning: Permanently added '192.168.1.164' (ED25519) "
+              "to the list of known hosts.\n")
+
+    def test_known_hosts_notice_is_benign(self):
+        self.assertTrue(self._agent()._is_benign_notice(
+            {"ok": False, "stderr": self.NOTICE}))
+
+    def test_notice_plus_a_real_error_is_not_benign(self):
+        self.assertFalse(self._agent()._is_benign_notice({
+            "ok": False,
+            "stderr": self.NOTICE,
+            "error": "command not found",
+        }))
+
+    def test_notice_alongside_other_stderr_is_not_benign(self):
+        self.assertFalse(self._agent()._is_benign_notice(
+            {"ok": False, "stderr": self.NOTICE + "rm: cannot remove '/x': Permission denied\n"}))
+
+    def test_other_ssh_noise_is_benign(self):
+        for text in (
+            "Pseudo-terminal will not be allocated because stdin is not a terminal.\n",
+            "Warning: Identity file /keys/lxc-170 not accessible: No such file or directory.\n",
+            "The authenticity of host '10.0.0.1' can't be established.\n",
+        ):
+            self.assertTrue(self._agent()._is_benign_notice({"ok": False, "stderr": text}), text)
+
+    def test_host_key_failure_is_benign_but_alone(self):
+        # With UserKnownHostsFile=/dev/null this can be the only reported line.
+        # It is still worth surfacing as a warning rather than a hard error.
+        self.assertTrue(self._agent()._is_benign_notice(
+            {"ok": False, "stderr": "Host key verification failed."}))
+
+    def test_genuine_failure_is_not_benign(self):
+        for text in (
+            "connection refused",
+            "Permission denied (publickey,password).",
+            "rm: cannot remove '/etc/x': Permission denied",
+        ):
+            self.assertFalse(self._agent()._is_benign_notice({"ok": False, "error": text}), text)
+
+    def test_ssh_invocations_suppress_the_known_hosts_notice(self):
+        # UserKnownHostsFile=/dev/null means the key is never remembered, so the
+        # notice fires on every connection. LogLevel=ERROR must be set.
+        from proxbot.cli.commands import exec as guest_exec
+        source = __import__("inspect").getsource(guest_exec._run_ssh_command)
+        self.assertIn("LogLevel=ERROR", source)
+        self.assertIn("UserKnownHostsFile=/dev/null", source)
 
 
 class RollingThoughtStreamerTests(unittest.TestCase):

@@ -21,6 +21,85 @@ Track bugs discovered while developing or using `scripts/Proxmox-cli.py`.
 
 Known open issues are listed below.
 
+### 2026-09-28 — `ssh exec` let the model reach a Proxmox node, bypassing every exec allowlist
+
+- Status: fixed
+- Found by: agent
+- Command: `ssh exec --host pveheavy --command "<anything>" --execute` (reachable from the model as the `ssh_exec` tool)
+- Expected: The model cannot obtain a host shell on a hypervisor node.
+- Actual: `ssh_exec` is a generic tool with a `host` parameter, so the model could aim SSH at a cluster node and run any command. Under `CHAT_AUTO_APPROVE=true` there was no prompt at all. This made the `pct exec` allowlist decorative — the model could route straight around it with a plain SSH call.
+- Suspected cause: No distinction was drawn between a guest target and a hypervisor target. The tool predates any notion of node access being privileged.
+- Fix notes: `cmd_ssh_exec` now refuses a target that resolves to a cluster node, matched against node names, their API-resolved addresses, and the configured default node. Matching is case-insensitive and covers FQDN forms (`pveheavy.lan`, `192.168.1.65.lan`), which would otherwise bypass an equality check. Refusal returns `node_target_refused` with `EXIT_SAFETY` and names `lxc pct-exec` as the sanctioned path. Targets listed in `PROXMOX_NODE_SSH_TARGETS` are never blocked; guests are unaffected.
+- Related log file: N/A
+
+### 2026-09-28 — Console output loss was reported as a successful command
+
+- Status: fixed
+- Found by: agent
+- Command: Any `lxc exec` that reached the termproxy fallback
+- Expected: An unverifiable result is reported as unknown.
+- Actual: Two fail-open paths. If the trailing `:$?` was not captured, `exit_code` silently defaulted to `0`, telling the agent a failed command had succeeded. If a boundary marker was missing, the function returned `None`, reported as "Could not establish a termproxy console session" — false, since the session had worked and only the result was unreadable.
+- Suspected cause: Fail-open defaults in the output parser, and overloading `None` for both "transport never came up" and "transport worked, result lost".
+- Fix notes: New `_parse_console_output()` reports `output_lost` with `exit_code: null` when the start marker, end marker, or exit status is missing, keeping partial output in `observed`. The exit status is matched anchored to the marker, so trailing scrollback such as `prompt:12` cannot be misread as the exit code. `output_lost` is distinct from `console_unavailable`, and the transport-failure message no longer asserts a session problem it cannot know about.
+- Related log file: N/A
+
+### 2026-09-28 — termproxy was an automatic exec fallback onto a shared pty
+
+- Status: fixed
+- Found by: agent
+- Command: `lxc exec` when guest SSH was unavailable, before `--console` existed
+- Expected: The agent does not attach to a terminal it may not own.
+- Actual: When SSH failed, `lxc exec` attached to the container console without asking. The LXC console is a single shared pty, so the attach can land on a human's live shell: ProxBot would type into it, append its SSH public key to that account, and hand the terminal's scrollback to the model as "command output". The prompt test is a generic `#`/`$` terminator, so it cannot tell whose session it found.
+- Suspected cause: The console was treated as a transport rather than as a shared interactive resource. Measured on pveheavy/170: the prompt appeared on only 2 of ~20 attachments, and on 0 of 13 with no other session holding the console.
+- Fix notes: `--console` is now required. Without it, `lxc exec` tries SSH and then returns `console_not_requested`, naming `--console` and `pct exec` as the alternatives. An absent `console` attribute means "not requested", so older `Namespace` callers cannot silently re-enable it. The dry-run plan lists the transports that will actually be used and is labelled `LXC EXEC` rather than `TERMPROXY`, since SSH is the primary path.
+- Related log file: N/A
+
+### 2026-09-28 — `lxc clone` has no `--ssh-public-keys`, so clones come up unreachable
+
+- Status: fixed
+- Found by: agent
+- Command: `lxc clone --node pveheavy --vmid 20300 --new-vmid 170 --execute`
+- Expected: A clone of a template with a baked-in SSH key arrives reachable.
+- Actual: Clones of template 20300 had no way in: no SSH key, no console login (see the getty entry below), and an address that collided with another node. `lxc create` supports `--ssh-public-keys`/`--ssh-keygen`, but `lxc clone` exposes only `--hostname --storage --pool --snapname`, so a key can only be baked in at create time.
+- Suspected cause: Template authoring had no supported path — converting a container to a template was reachable only through the raw API.
+- Fix notes: `lxc create --as-template` converts the new container after creation and prints the clone command to use it. The dry-run plan shows the follow-up `POST /nodes/{node}/lxc/<vmid>/template` call. With a stock `debian-13-standard` tarball this yields a base template whose clones arrive with working guest SSH, needing neither a console login nor node-side `pct exec`.
+- Related log file: N/A
+
+### 2026-09-28 — LXC console exec reports "incorrect password" without ever testing a credential
+
+- Status: fixed
+- Found by: human
+- Command: `./chat.py` → `lxc_exec` against a container whose tty1 has no getty
+- Expected: Either a successful console login, or an error that names the actual reason.
+- Actual: `Console login failed (incorrect password or login timed out).` after ~13 s, repeated on every call. A manual test of the same password worked, so the diagnosis pointed at the operator.
+- Suspected cause: The code classified "no credential prompt received" as "needs a password". The chat harness then prompted via `getpass`, the retry sent `root\r\n` and the password into a console with no prompt to answer, and the failure was reported as a bad credential. No credential was ever validated. The same misclassification on the password-less probe produced a bogus `login_required`, which is what triggered the prompt in the first place.
+- Investigation (container 170 on pveheavy, pve-manager 9.1.5): the console is a **single shared pty whose prompt is not reliably replayed on attach**. A prompt was observed on only **2 of ~20 attachments**, and on **0 of 13** with no other session holding it. `Sec-WebSocket-Protocol` is *not* a factor — pveproxy accepts and echoes `binary`, `xtermjs` and `novnc`, and the one successful attach requested no subprotocol at all. Input echo was never observed: Enter, Ctrl-C and `root` produced no bytes back on any attach. `getty@tty1.service` is **inactive**; `agetty` runs on `pts/0` and `pts/2` instead, so the browser console and any automated client are not necessarily on the same pty. A *stopped* container (20300) echoes `lxc-console: 20300 is not running`, which confirms the transport itself is healthy.
+- Fix notes: `src/proxbot/cli/commands/exec.py` — the console probe now waits on an idle deadline instead of a frame count; a missing credential prompt is reported as the distinct status `console_unavailable`; `login_failed` distinguishes a rejected credential (`login incorrect` / PAM denial) from "accepted but no shell prompt within 4s"; a termproxy transport failure also maps to `console_unavailable` instead of `login_required`, so a broken socket cannot trigger a pointless password prompt. The chat harness only escalates to `getpass` on `login_required`, so a console that yields no prompt no longer re-prompts on every call. `src/proxbot/chat/agent.py` — the prompt no longer hardcodes `root`; it uses `args.get("user") or "root"`, matching the CLI default. Added `cmd_lxc_exec`, `lxc_exec` to `KNOWN_CHANGES` in `tests/verify_cli_equivalence.py`.
+- Follow-up: the `is_active_shell` branch remains a hazard. When ProxBot *does* win the race and matches a live prompt, it types into whatever session holds that pty — a human's shell, possibly — and parses that screen as command output. It cannot distinguish the two. The console should be demoted to an explicit opt-in, and automated exec should move to `pct exec` (out-of-band, never touches the pty). Not yet done.
+- Related log file: `scripts/logs/chat-sessions/chat-20260928-152857-82994d.jsonl`
+
+### 2026-09-28 — `lxc exec` SSH fallback ran commands on the Proxmox host instead of the container
+
+- Status: open
+- Found by: agent
+- Command: `lxc exec --node pveheavy --vmid 170 --command "hostname" --execute`
+- Expected: Output from container 170.
+- Actual: Output from the **Proxmox node `pvestore`**: `hostname` → `pvestore`, `ls /sys/class/net` → host NICs (`eno1-4`, `vmbr0`, `tap120i0`, `fwbr*`), `df -h /` → `rpool/ROOT/pve-1` (host ZFS dataset). The result was reported as a successful container exec, and the chat agent then spent several turns debugging a non-existent "eth0 missing in the guest" problem. ProxBot also wrote its own public key into `pvestore`'s `/root/.ssh/authorized_keys` (4 `*-proxbot` entries) via the key-injection step.
+- Suspected cause: `_resolve_guest_ip` returns the first non-loopback address from `GET /nodes/{node}/lxc/{vmid}/interfaces` without verifying that the address still belongs to that container. Container 170 was DHCP-assigned `192.168.1.65/24`, which is a **static address owned by the peer node `pvestore`** (`pveheavy` is `192.168.1.55`). With a duplicate address on the segment, SSH to `192.168.1.65` reaches whichever host answers ARP — `pvestore`.
+- Fix notes: Not yet fixed. `_resolve_guest_ip` should validate the candidate against the container's `hwaddr` (or assert the expected hostname after connecting) and fail loudly instead of executing on an unrelated host. `cmd_lxc_exec` should also refuse to present a host-shell result as a container result. The `*-proxbot` keys in `pvestore:/root/.ssh/authorized_keys` need to be removed.
+- Related log file: `scripts/logs/chat-sessions/chat-20260928-152857-82994d.jsonl`
+
+### 2026-09-28 — Cloned template containers have no getty on tty1 and collide with a static node address
+
+- Status: open
+- Found by: agent
+- Command: `lxc clone --node pveheavy --vmid 20300 --new-vmid 170 --execute` then `lxc start`
+- Expected: A clone that is reachable over SSH with a console login available as a fallback.
+- Actual: The clone boots and DHCP works, but (a) tty1 produces no `login:` prompt, so the termproxy console is unusable, and (b) it was assigned `192.168.1.65`, a static address already held by node `pvestore`.
+- Suspected cause: Template `20300` (`Debian-Template-No-Docker`) is a converted template whose guest has no enabled `getty@tty1`, and the DHCP scope on `192.168.1.0/24` overlaps statically configured node addresses. Note `lxc clone` exposes no `--ssh-public-keys` (only `--hostname --storage --pool --snapname`), so a key cannot be injected at clone time the way `lxc create --ssh-public-keys` does.
+- Fix notes: Not yet fixed. Options: bake an authorized key into template 20300 once so future clones are reachable, and exclude statically held addresses from the DHCP scope. In the meantime the only in-guest path that needs no guest credential is node SSH plus `pct exec <vmid> -- <cmd>` — `pveheavy:22` is open and `ssh exec --host <node> --command "pct exec <vmid> -- <cmd>"` already works, but it requires granting ProxBot root on the node and constraining it to `pct exec`.
+- Related log file: N/A
+
 ### 2026-09-28 — chat.py markdown tables render broken (dropped rows, split boxes, misaligned borders)
 
 - Status: fixed
@@ -265,3 +344,25 @@ Known open issues are listed below.
 - Suspected cause: Undefined constant; the intended alias was `EXIT_API`.
 - Fix notes: Replaced all 3 uses with `EXIT_API`.
 - Related log file: N/A
+
+## 2026-09-28 — `ssh_exec` auth failure looped instead of asking for credentials
+
+- Status: fixed
+- Found by: human
+- Command: `chat.py` → "try to access container 170's shell" → `lxc_exec` (console_not_requested) → `lxc_pct_exec` (node SSH unconfigured) → `ssh_exec root@192.168.1.164` × 2 → `Permission denied (publickey,password)` twice, user interrupted
+- Expected: On publickey/password denial the harness stops and asks the operator for a corrected username, key file, or password instead of retrying identical credentials.
+- Actual: `ssh_exec` had no auth-failure escalation (unlike `lxc_exec` login_required and `lxc_pct_exec` node_password_required), and the CLI/executor had no `--password` plumbing for `ssh exec`, so the model retried the same failing root login in a loop (watchdog allows 2 duplicates).
+- Suspected cause: Auth-failure string was returned as a generic error with no `ssh_auth_failed` status and no getpass prompt path.
+- Fix notes: `ChatAgent` now detects `Permission denied (publickey…)` / auth-failure patterns (including nested `data.stderr`), prompts for SSH user (default prior user), key file (`none` to clear), and password via getpass, retries once with updated creds, else returns `status=ssh_auth_failed` with an explicit do-not-retry instruction. Added `--password` to `ssh exec` parser + executor forwarding (redacted via existing `--password` rules; session logs redact `password`/`key` substrings). Updated `ssh_exec` spec + system prompt to forbid blind retries.
+- Related log file: N/A (transcript in report)
+
+## 2026-09-28 — `/doctor` crashed with `NameError: json is not defined`
+
+- Status: fixed
+- Found by: human
+- Command: `./chat.py` → `/doctor`
+- Expected: Cluster health JSON rendered as Markdown.
+- Actual: `NameError: name 'json' is not defined` — the `chat.py` composition-root shim uses `json.dumps` in its `/doctor`, `/nodes`, `/vms`, `/lxcs`, `/templates`, and `/registry` handlers but never imported `json`.
+- Suspected cause: Refactor moved the implementation into `src/proxbot/` while `main()` stayed in the shim; the import did not move with it.
+- Fix notes: Added `import json` to `chat.py`. Verified: shim compiles, `--help` works, `/doctor` and `/nodes` render paths produce output, 169 unittests pass. Note: `chat.py: error: unrecognized arguments: --console` is expected — `--console` is a `Proxmox-cli.py lxc exec` flag, not a `chat.py` flag.
+- Related log file: scripts/logs/chat-sessions/chat-20260928-184525-0f0379.jsonl

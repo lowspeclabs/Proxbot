@@ -11,6 +11,7 @@ tests (`import chat`), and the approval/REPL loop keep working unchanged.
 """
 
 import argparse
+import json
 import pathlib
 import sys
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,8 +31,13 @@ from proxbot.chat.session import SessionLogger  # noqa: F401
 from proxbot.chat.streamer import RollingThoughtStreamer  # noqa: F401
 from proxbot.chat.spec import (  # noqa: F401
     TOOLS_SPEC, READ_ONLY_TOOLS, WRITE_TOOLS, DESTRUCTIVE_TOOLS,
+    HARNESS_ASSEMBLED_TOOLS,
 )
-from proxbot.chat.watchdog import LoopWatchdog, extract_embedded_tool_calls  # noqa: F401
+from proxbot.chat.watchdog import (  # noqa: F401
+    LoopWatchdog,
+    extract_embedded_tool_calls,
+    validate_harness_command,
+)
 from proxbot.chat.executor import ProxmoxToolExecutor  # noqa: F401
 from proxbot.chat.safety import SafetyGate  # noqa: F401
 from proxbot.chat.agent import ChatAgent  # noqa: F401

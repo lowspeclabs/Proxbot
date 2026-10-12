@@ -5,6 +5,11 @@
 *.pem
 *.key
 
+# A literal "~" directory means an unexpanded --keyfile ~/... created keys
+# inside the repo. Tilde expansion does not apply to text inside a shell
+# variable, so this is easy to produce by accident. Never commit it.
+~/
+
 # Generated SSH keys (lxc create --ssh-keygen writes these into the repo root)
 .lxc-ssh-key-*
 .lxc-ssh-key-*.pub

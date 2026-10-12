@@ -41,6 +41,22 @@ class Config:
         self.timeout_seconds = _parse_int(raw.get("PROXMOX_TIMEOUT_SECONDS", "30"), 30)
         self.default_node = (raw.get("PROXMOX_DEFAULT_NODE") or "").strip() or None
         self.output_format = (raw.get("PROXMOX_OUTPUT_FORMAT") or "md").strip().lower()
+
+        # Node SSH access, used only by the `pct exec` transport. Absent by
+        # default: without these, `lxc exec` never shells out to a node and
+        # there is no host-side execution capability at all.
+        self.node_ssh_user = (raw.get("PROXMOX_NODE_SSH_USER") or "").strip() or None
+        self.node_ssh_port = _parse_int(raw.get("PROXMOX_NODE_SSH_PORT", "22"), 22)
+        self.node_ssh_key = (raw.get("PROXMOX_NODE_SSH_KEY") or "").strip() or None
+        # Password auth for the node, as an alternative to a key. A key is
+        # preferred when both are set: it does not leave a reusable secret in
+        # .env and does not need SSH_ASKPASS on every call.
+        self.node_ssh_password = raw.get("PROXMOX_NODE_SSH_PASSWORD") or None
+        # Resolved from the cluster at runtime when unset; see node_ssh_hosts().
+        self.node_ssh_timeout = _parse_int(raw.get("PROXMOX_NODE_SSH_TIMEOUT", "10"), 10)
+        # Escape hatch for the ssh_exec guard. Off by default: a node is a much
+        # more valuable target than a guest, so it must be named explicitly.
+        self.node_ssh_targets = _split_list(raw.get("PROXMOX_NODE_SSH_TARGETS"))
         log_dir = pathlib.Path(raw.get("PROXMOX_LOG_DIR") or DEFAULT_LOG_DIR)
         self.log_dir = log_dir if log_dir.is_absolute() else REPO_ROOT / log_dir
 
@@ -63,6 +79,32 @@ class Config:
 
     def redacted_header(self) -> str:
         return f"PVEAPIToken={self.token_id}={REDACTED}"
+
+    @property
+    def node_ssh_configured(self) -> bool:
+        """True when enough is set to attempt node SSH (host comes from the API)."""
+        return bool(self.node_ssh_user and (self.node_ssh_key or self.node_ssh_password))
+
+    @property
+    def node_ssh_auth_method(self) -> str | None:
+        """Which credential node SSH will actually use. Key wins over password."""
+        if not self.node_ssh_configured:
+            return None
+        return "key" if self.node_ssh_key else "password"
+
+    def node_ssh_missing(self) -> list[str]:
+        missing = []
+        if not self.node_ssh_user:
+            missing.append("PROXMOX_NODE_SSH_USER")
+        if not (self.node_ssh_key or self.node_ssh_password):
+            missing.append("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD")
+        return missing
+
+
+def _split_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _parse_bool(value: str | None) -> bool:

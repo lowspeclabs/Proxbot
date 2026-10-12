@@ -12,7 +12,38 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parents[1]
 # Known, intentional divergences from the pre-refactor script.
 # cmd_vm_exec: EXIT_API_ERROR (undefined constant) replaced with EXIT_API.
-KNOWN_CHANGES = {"cmd_vm_exec"}
+# cmd_lxc_exec/lxc_exec: console auth diagnostics — a silent tty1 now reports
+#   console_unavailable instead of guessing login_failed/login_required, and
+#   credential rejection is distinguished from a post-login timeout.
+# build_parser: `lxc exec` gained --console, so the termproxy fallback is opt-in.
+# Config/Config.__init__/cmd_doctor/main: node SSH settings and the
+#   doctor --node-access probe, plus the `lxc pct-exec` dispatch branch.
+# cmd_lxc_create: --as-template converts a freshly created container to a
+#   template, for building a keyed base image that clones inherit.
+# _redact_command_str: now delegates to the shared secret-flag pattern so the
+#   argv and joined-string forms cannot drift apart.
+# _run_ssh_command: adds LogLevel=ERROR so the "Permanently added ..."
+#   notice stops firing on every connection (UserKnownHostsFile=/dev/null
+#   means the host key is never remembered, so the notice carries no
+#   information).
+# cmd_ssh_exec: refuses Proxmox node targets so the pct exec allowlist
+#   cannot be bypassed with a generic SSH call.
+# cmd_pct_exec and its helpers are new, so they have no baseline to differ from.
+KNOWN_CHANGES = {
+    "build_parser",
+    "cmd_doctor",
+    "cmd_lxc_create",
+    "cmd_lxc_exec",
+    "cmd_pct_exec",
+    "cmd_ssh_exec",
+    "cmd_vm_exec",
+    "lxc_exec",
+    "main",
+    "_redact_command_str",
+    "_run_ssh_command",
+    "Config",
+    "Config.__init__",
+}
 
 ORIG = pathlib.Path("/tmp/opencode/Proxmox-cli.py.orig")
 # Only the CLI-side modules correspond to the original CLI script. The chat and

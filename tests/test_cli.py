@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import tempfile
 import unittest
@@ -214,7 +215,9 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(exit_code, cli.EXIT_SUCCESS)
         result = json.loads(stdout.getvalue())
         self.assertTrue(result["dry_run"])
-        self.assertEqual(result["data"]["body"], {"command": "uptime"})
+        self.assertEqual(result["data"]["body"], {"command": "uptime", "user": "root", "console": False})
+        # The console must not appear in the transport list unless requested.
+        self.assertEqual(result["data"]["target"]["transports"], ["ssh"])
 
     def test_lxc_exec_live(self):
         class Client:
@@ -222,9 +225,12 @@ class CliContractTests(unittest.TestCase):
                 return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {"port": 5900, "ticket": "tick", "user": "root@pam"}, "error": None}
 
             def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
                 return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
 
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -242,7 +248,7 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(result["data"]["exit_code"], 0)
 
     def test_lxc_exec_login_required(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password=None, no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password=None, no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -257,8 +263,149 @@ class CliContractTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "login_required")
 
+    def test_lxc_exec_console_unavailable(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        silent = {
+            "ok": False,
+            "status": "console_unavailable",
+            "vmid": "100",
+            "node": "pve",
+            "error": "Container 100 console is silent - no login or password prompt was received on tty1",
+            "method": "termproxy",
+        }
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(silent)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        # Not EXIT_AUTH: no credential was tested, so the chat harness must not
+        # escalate to a getpass prompt.
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "console_unavailable")
+
+    def test_lxc_exec_login_rejected_is_distinct_from_timeout(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        rejected = {
+            "ok": False,
+            "status": "login_failed",
+            "vmid": "100",
+            "node": "pve",
+            "error": "Console login rejected by container 100 - wrong username or password.",
+            "method": "termproxy",
+        }
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(rejected)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "login_failed")
+        self.assertIn("rejected", result["error"])
+
+    def test_lxc_exec_transport_failure_is_not_login_required(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None, no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(None)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "console_unavailable")
+
+    def test_console_is_never_used_without_optin(self):
+        # Without --console, termproxy must not be called at all. The console is
+        # a single shared pty and attaching can type into a human's live shell.
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("lxc_exec must not be called without --console")
+
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
+                                  no_auto_inject_key=False, key_file=None, console=False, timeout=30,
+                                  execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _explode}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "console_not_requested")
+        self.assertIn("--console", result["error"])
+
+    def test_missing_console_attribute_defaults_to_no_console(self):
+        # Older callers build a Namespace without `console`; absent must mean
+        # "not requested", never "allowed".
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("lxc_exec must not be called when console is absent")
+
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
+                                  no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _explode}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        self.assertEqual(json.loads(stderr.getvalue())["status"], "console_not_requested")
+
+    def test_console_optin_does_not_bypass_ssh(self):
+        # With --console the SSH path still runs first and its result wins.
+        class Client:
+            def post(self, endpoint, body):
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": {"port": 5900, "ticket": "tick", "user": "root@pam"}, "error": None}
+
+            def get(self, endpoint):
+                if endpoint.endswith("/interfaces"):
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": [{"name": "eth0", "inet": "10.0.0.5/24"}], "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        def _explode(*_args, **_kwargs):
+            raise AssertionError("termproxy must not be used when SSH succeeds")
+
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password="pw",
+                                  no_auto_inject_key=False, key_file="/nonexistent/key", console=True,
+                                  port=22, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stdout = io.StringIO()
+        with unittest.mock.patch.dict(cli.cmd_ssh_exec.__globals__, {"_run_ssh_command": lambda **kw: (0, "uptime ok\n", "")}), \
+             unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _explode}):
+            with contextlib.redirect_stdout(stdout):
+                exit_code = cli.cmd_lxc_exec(args, config, Client(), cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertIn("uptime ok", stdout.getvalue())
+
     def test_lxc_exec_with_password(self):
-        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, timeout=30, execute=True, format="json")
+        args = argparse.Namespace(node="pve", vmid=100, command="uname -r", user="root", password="secretpassword", no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
         config = cli.Config({
             "PROXMOX_API_URL": "https://pve.example/api2/json",
             "PROXMOX_API_TOKEN_ID": "agent@pve!test",
@@ -444,6 +591,599 @@ class CliContractTests(unittest.TestCase):
         diag = result["agent_diagnosis"]
         self.assertEqual(diag["agent_status"], "vm_stopped")
         self.assertIn("vm start", diag["hint"])
+
+
+class ConsoleOutputParsingTests(unittest.TestCase):
+    """The console transport must fail closed, never report a false exit 0."""
+
+    BEG = "__PROXBOT_BEG_1__"
+    END = "__PROXBOT_END_1__"
+
+    def _parse(self, text, authenticated=False):
+        return cli._parse_console_output(text, self.BEG, self.END, "170", "pveheavy", 30, authenticated)
+
+    def test_complete_output_reports_exit_code(self):
+        res = self._parse(f"{self.BEG}\nhello\n{self.END}:0\r\n")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["exit_code"], 0)
+        self.assertEqual(res["stdout"], "hello")
+        self.assertNotIn("status", res)
+
+    def test_nonzero_exit_is_reported(self):
+        res = self._parse(f"{self.BEG}\nboom\n{self.END}:127\r\n")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["exit_code"], 127)
+
+    def test_missing_start_marker_is_output_lost(self):
+        res = self._parse("just some scrollback\r\n")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+        self.assertIn("start marker", res["error"])
+
+    def test_missing_end_marker_is_output_lost_not_success(self):
+        # Regression: this used to fall through to return None and be reported
+        # as a transport failure, and an unterminated marker used to imply 0.
+        res = self._parse(f"{self.BEG}\npartial output that scrolled\r\n")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+        self.assertIn("end marker", res["error"])
+        self.assertIn("partial output", res["observed"])
+
+    def test_truncated_exit_status_is_unknown_not_zero(self):
+        # Regression: exit_code defaulted to 0 when ':$?' was not captured.
+        res = self._parse(f"{self.BEG}\noutput\r\n{self.END}")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+        self.assertIn("exit status", res["error"])
+
+    def test_exit_status_looking_like_other_digits_is_not_misread(self):
+        # A prompt or scrollback containing "foo:12" after the end marker must
+        # not be mistaken for the command's exit status.
+        res = self._parse(f"{self.BEG}\nout\r\n{self.END} some prompt:12")
+        self.assertEqual(res["status"], "output_lost")
+        self.assertIsNone(res["exit_code"])
+
+    def test_output_lost_is_distinct_from_transport_failure(self):
+        args = argparse.Namespace(node="pve", vmid=100, command="uptime", user="root", password=None,
+                                  no_auto_inject_key=False, key_file=None, console=True, timeout=30, execute=True, format="json")
+        config = cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+        stderr = io.StringIO()
+        lost = {"ok": False, "status": "output_lost", "vmid": "100", "node": "pve",
+                "error": "Container 100: the command was sent to the console but its result could not be verified",
+                "exit_code": None, "method": "termproxy"}
+        with unittest.mock.patch.dict(cli.cmd_lxc_exec.__globals__, {"lxc_exec": _fake_lxc_exec(lost)}):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_lxc_exec(args, config, None, cli.Logger(config.log_dir, no_log=True, config=config))
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "output_lost")
+        self.assertIsNone(result["data"]["exit_code"])
+
+
+class PctExecTests(unittest.TestCase):
+    """The pct exec transport: harness-assembled argv, no general node shell."""
+
+    def _config(self, **extra):
+        raw = {
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        }
+        raw.update(extra)
+        return cli.Config(raw)
+
+    def test_assemble_quotes_vmid_and_command(self):
+        self.assertEqual(
+            cli.assemble_pct_exec("170", "id"),
+            "pct exec 170 -- /bin/sh -lc id",
+        )
+
+    def test_assemble_neutralises_shell_metacharacters_in_command(self):
+        remote = cli.assemble_pct_exec("170", 'id; touch /tmp/pwned')
+        # The whole command must be a single quoted argument, so the node shell
+        # cannot split it into a second command.
+        self.assertEqual(remote, "pct exec 170 -- /bin/sh -lc 'id; touch /tmp/pwned'")
+        self.assertEqual(remote.count("'"), 2)
+
+    def test_refuses_non_numeric_vmid_before_any_ssh(self):
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH with an unvalidated vmid")
+
+        args = argparse.Namespace(node="pve", vmid="170; rm -rf /", command="id", timeout=30,
+                                  execute=True, format="json")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_VALIDATION)
+
+    def test_refuses_when_node_ssh_unconfigured(self):
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH when node access is unconfigured")
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=True, format="json")
+        stderr = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            with contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_VALIDATION)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "node_ssh_unconfigured")
+        self.assertIn("PROXMOX_NODE_SSH_USER", result["error"])
+
+    def test_runs_assembled_command_and_returns_real_exit_code(self):
+        seen = {}
+
+        def _fake_ssh(**kwargs):
+            seen.update(kwargs)
+            return (7, "partial output\n", "command not found\n")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint == "/nodes/pve/network":
+                    return {"ok": True, "data": [
+                        {"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"},
+                        {"iface": "eno1", "type": "eth", "cidr": None},
+                    ]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="nonexistent-binary", timeout=30,
+                                  execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root",
+                              PROXMOX_NODE_SSH_KEY="/keys/node")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake_ssh):
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                exit_code = cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+
+        # Prefers the bridge address, assembles the remote command itself, and
+        # does not turn a failing command into a success.
+        self.assertEqual(seen["host"], "10.0.0.1")
+        self.assertEqual(seen["user"], "root")
+        self.assertEqual(seen["command"], "pct exec 170 -- /bin/sh -lc nonexistent-binary")
+        self.assertEqual(exit_code, cli.EXIT_INTERNAL)
+        result = json.loads(stdout.getvalue() or stderr.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["data"]["exit_code"], 7)
+        self.assertEqual(result["data"]["transport"], "pct_exec")
+
+    def test_dry_run_by_default_shows_the_remote_command(self):
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=False, format="json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_pct_exec(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["data"]["target"]["remote"], "pct exec 170 -- /bin/sh -lc id")
+
+    # --- password authentication ----------------------------------------
+    def test_password_only_counts_as_configured(self):
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        self.assertTrue(config.node_ssh_configured)
+        self.assertEqual(config.node_ssh_auth_method, "password")
+
+    def test_key_wins_when_both_are_set(self):
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_KEY="/k",
+                              PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        self.assertEqual(config.node_ssh_auth_method, "key")
+
+    def test_user_alone_is_not_configured(self):
+        config = self._config(PROXMOX_NODE_SSH_USER="root")
+        self.assertFalse(config.node_ssh_configured)
+        self.assertIn("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD", config.node_ssh_missing())
+
+    def test_asks_for_a_password_when_only_a_user_is_set(self):
+        # A user with no credential is promptable, so the harness collects the
+        # password rather than reporting a configuration error.
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            exit_code = cli.cmd_pct_exec(args, config, None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_AUTH)
+        result = json.loads(stderr.getvalue())
+        self.assertEqual(result["status"], "node_password_required")
+        self.assertEqual(result["data"]["user"], "root")
+
+    def test_key_set_is_never_prompted(self):
+        # With a key configured there is nothing to prompt for.
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH when no address is resolvable")
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=None, timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_KEY="/k")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                code = cli.cmd_pct_exec(args, config, None, cli.Logger(None, no_log=True))
+        self.assertNotEqual(code, cli.EXIT_AUTH)
+        self.assertNotEqual(json.loads(err.getvalue())["status"], "node_password_required")
+
+    def test_reads_password_from_inherited_fd(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"from-fd\n")
+        os.close(write_fd)
+        # _read_password_fd takes ownership of the descriptor, so it is already
+        # closed here and must not be closed again by the caller.
+        self.assertEqual(cli._read_password_fd(read_fd), "from-fd")
+
+    def test_reads_password_from_a_descriptor_with_no_trailing_newline(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"no-newline")
+        os.close(write_fd)
+        self.assertEqual(cli._read_password_fd(read_fd), "no-newline")
+
+    def test_unreadable_descriptor_is_reported_not_raised(self):
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  node_password_fd=9999, timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="env-pw")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_VALIDATION)
+        self.assertEqual(json.loads(stderr.getvalue())["status"], "node_password_read_failed")
+
+    def test_explicit_password_wins_over_fd(self):
+        self.assertEqual(
+            cli._resolve_node_password(
+                argparse.Namespace(node_password="explicit", node_password_fd=-1), self._config()
+            ),
+            "explicit",
+        )
+
+    def test_fd_wins_over_configured_password(self):
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"from-fd\n")
+        os.close(write_fd)
+        resolved = cli._resolve_node_password(
+            argparse.Namespace(node_password=None, node_password_fd=read_fd),
+            self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="env-pw"),
+        )
+        self.assertEqual(resolved, "from-fd")
+
+    def test_passes_configured_password_to_ssh(self):
+        seen = {}
+
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return (0, "root@node\n", "")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password=None,
+                                  timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(seen["password"], "s3cret")
+        self.assertIsNone(seen["key_file"])
+
+    def test_explicit_node_password_overrides_config(self):
+        seen = {}
+
+        def _fake(**kwargs):
+            seen.update(kwargs)
+            return (0, "ok\n", "")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(node="pve", vmid=170, command="id", node_password="from-flag",
+                                  timeout=30, execute=True, format="json")
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="from-env")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli.cmd_pct_exec(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(seen["password"], "from-flag")
+
+    def test_probe_reports_password_auth_without_leaking_it(self):
+        def _fake(**kwargs):
+            return (0, "proxmox-ve 9.1.5", "")
+
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                if endpoint.endswith("/network"):
+                    return {"ok": True, "data": [{"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"}]}
+                return {"ok": True, "data": {}}
+
+        config = self._config(PROXMOX_NODE_SSH_USER="root", PROXMOX_NODE_SSH_PASSWORD="s3cret")
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            report = cli.probe_node_ssh("pve", config, Client())
+        self.assertTrue(report["usable"])
+        self.assertEqual(report["auth_method"], "password")
+        # The probe is surfaced to the operator via doctor, so it must not
+        # contain the secret in any form.
+        self.assertNotIn("s3cret", json.dumps(report))
+
+    def test_node_password_is_redacted_in_argv(self):
+        from proxbot.common.redact import _redact_argv
+        redacted = _redact_argv(
+            ["lxc", "pct-exec", "--node", "pve", "--node-password", "s3cret", "--execute"],
+            self._config(),
+        )
+        self.assertNotIn("s3cret", redacted)
+        self.assertIn("***REDACTED***", redacted)
+
+    def test_node_password_is_redacted_in_the_command_string(self):
+        # Regression: the argv form and the joined-string form were separate
+        # patterns, so --node-password was redacted in one and leaked in the
+        # other. Both must now use the same list.
+        from proxbot.common.redact import _redact_command_str, redact_command_secrets
+        for secret_flag in ("--node-password", "--password", "--token-secret",
+                            "--api-token-secret", "--secret", "--private-key"):
+            for sep in (" ", "="):
+                raw = f"lxc pct-exec --vmid 170 {secret_flag}{sep}s3cret --command id"
+                self.assertNotIn("s3cret", _redact_command_str(raw), f"{secret_flag}{sep} leaked via _redact_command_str")
+                self.assertNotIn("s3cret", redact_command_secrets(raw), f"{secret_flag}{sep} leaked via redact_command_secrets")
+
+    def test_argv_and_string_redaction_cover_the_same_flags(self):
+        from proxbot.common.redact import SENSITIVE_ARGV_FLAGS, _redact_argv, redact_command_secrets
+        for flag in SENSITIVE_ARGV_FLAGS:
+            if flag == "--command":
+                continue  # covered separately; it is a value carrier
+            redacted = redact_command_secrets(f"cmd {flag} s3cret")
+            self.assertNotIn("s3cret", redacted, f"{flag} leaks in the string form")
+            argv_redacted = _redact_argv(["cmd", flag, "s3cret"])
+            self.assertNotIn("s3cret", argv_redacted, f"{flag} leaks in the argv form")
+
+    def test_probe_reports_unconfigured_without_ssh(self):
+        def _explode(*_a, **_k):
+            raise AssertionError("probe must not SSH when unconfigured")
+
+        report = {}
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            report = cli.probe_node_ssh("pve", self._config(), None)
+        self.assertFalse(report["usable"])
+        self.assertFalse(report["configured"])
+        self.assertIn("PROXMOX_NODE_SSH_KEY or PROXMOX_NODE_SSH_PASSWORD", report["missing"])
+
+    def test_doctor_reports_transport_availability(self):
+        args = argparse.Namespace(live=False, node_access=False, node=None, format="json")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            cli.cmd_doctor(args, self._config(), None, cli.Logger(None, no_log=True))
+        data = json.loads(stdout.getvalue())["data"]
+        self.assertIn("pct_exec", data["exec_transports"])
+        self.assertIn("opt-in", data["exec_transports"]["console"])
+        self.assertFalse(data["node_ssh"]["configured"])
+
+    def test_doctor_node_access_survives_absence_of_node_arg(self):
+        # `doctor` has no --node flag, so reading args.node directly raised
+        # AttributeError. Use --node-access, which probes every node.
+        class Client:
+            def get(self, endpoint):
+                if endpoint == "/version":
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"version": "9.1.5"}, "error": None}
+                if endpoint == "/nodes":
+                    return {"ok": True, "data": [{"node": "pve"}]}
+                return {"ok": True, "data": {}}
+
+        args = argparse.Namespace(live=True, node_access=True, format="json")  # no .node
+        config = self._config(PROXMOX_API_URL="https://pve.example/api2/json",
+                              PROXMOX_API_TOKEN_ID="a@b!c", PROXMOX_API_TOKEN_SECRET="s")
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_doctor(args, config, Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        data = json.loads(stdout.getvalue())["data"]
+        self.assertIn("node_access", data)
+        self.assertEqual([p["node"] for p in data["node_access"]], ["pve"])
+        self.assertFalse(data["pct_exec_available"])
+
+
+class NodeTargetGuardTests(unittest.TestCase):
+    """`ssh exec` must not double as a host shell that bypasses pct exec."""
+
+    def _config(self, **extra):
+        raw = {
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        }
+        raw.update(extra)
+        return cli.Config(raw)
+
+    class Client:
+        def get(self, endpoint):
+            if endpoint == "/nodes":
+                return {"ok": True, "data": [{"node": "pveheavy"}, {"node": "pvestore"}]}
+            if endpoint.endswith("/network"):
+                return {"ok": True, "data": [
+                    {"iface": "vmbr0", "type": "bridge", "cidr": "10.0.0.1/24"},
+                ]}
+            return {"ok": True, "data": {}}
+
+    def _refused(self, host, config=None, client=None):
+        def _explode(*_a, **_k):
+            raise AssertionError("must not SSH to a Proxmox node")
+
+        args = argparse.Namespace(host=host, node=None, vmid=None, command="id", user="root",
+                                  password=None, port=22, key_file=None, timeout=10,
+                                  no_auto_inject_key=True, execute=True, format="json")
+        out = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _explode):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = cli.cmd_ssh_exec(args, config or self._config(), client or self.Client(),
+                                        cli.Logger(None, no_log=True))
+        return code, out.getvalue()
+
+    def test_refuses_node_name(self):
+        code, out = self._refused("pveheavy")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+        self.assertEqual(json.loads(out)["status"], "node_target_refused")
+
+    def test_refuses_node_name_case_insensitively(self):
+        code, _ = self._refused("PVEHEAVY")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_refuses_node_address(self):
+        code, _ = self._refused("10.0.0.1")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_refuses_node_address_with_domain_suffix(self):
+        # Guards against the FQDN bypass: 10.0.0.1.lan must not slip through.
+        code, _ = self._refused("10.0.0.1.lan")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_refuses_node_name_with_domain_suffix(self):
+        code, _ = self._refused("pveheavy.example.net")
+        self.assertEqual(code, cli.EXIT_SAFETY)
+
+    def test_allows_explicitly_listed_target(self):
+        config = self._config(PROXMOX_NODE_SSH_TARGETS="pveheavy,10.0.0.1")
+        def _fake(**_kwargs):
+            return (0, "ok\n", "")
+        args = argparse.Namespace(host="pveheavy", node=None, vmid=None, command="id", user="root",
+                                  password=None, port=22, key_file=None, timeout=10,
+                                  no_auto_inject_key=True, execute=True, format="json")
+        out = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(out):
+                code = cli.cmd_ssh_exec(args, config, self.Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_SUCCESS)
+
+    def test_does_not_block_a_guest(self):
+        def _fake(**_kwargs):
+            return (0, "guest ok\n", "")
+        args = argparse.Namespace(host="10.0.0.99", node=None, vmid=None, command="id", user="root",
+                                  password=None, port=22, key_file=None, timeout=10,
+                                  no_auto_inject_key=True, execute=True, format="json")
+        out = io.StringIO()
+        with unittest.mock.patch("proxbot.cli.commands.exec._run_ssh_command", _fake):
+            with contextlib.redirect_stdout(out):
+                code = cli.cmd_ssh_exec(args, self._config(), self.Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(code, cli.EXIT_SUCCESS)
+        self.assertIn("guest ok", out.getvalue())
+
+
+class AsTemplateTests(unittest.TestCase):
+    """`lxc create --as-template` builds a keyed base image for clones to inherit."""
+
+    def _config(self):
+        return cli.Config({
+            "PROXMOX_API_URL": "https://pve.example/api2/json",
+            "PROXMOX_API_TOKEN_ID": "agent@pve!test",
+            "PROXMOX_API_TOKEN_SECRET": "secret",
+        })
+
+    def _args(self, **extra):
+        base = dict(node="pve", vmid=90001, hostname="base", storage="local",
+                    ostemplate="local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst",
+                    ssh_public_keys="ssh-ed25519 AAAA test@host", ssh_keygen=False,
+                    unprivileged=True, features=None, password=None, cores=None, memory=None,
+                    swap=None, net0=None, rootfs=None, nameserver=None, onboot=None,
+                    data=None, execute=True, wait=True, wait_timeout=60, as_template=True, format="json")
+        base.update(extra)
+        return argparse.Namespace(**base)
+
+    def test_dry_run_shows_the_followup_template_call(self):
+        args = self._args(execute=False)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            exit_code = cli.cmd_lxc_create(args, self._config(), None, cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        result = json.loads(stdout.getvalue())
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["data"]["target"]["then"], "POST /nodes/pve/lxc/90001/template")
+
+    def test_create_then_converts_to_template(self):
+        calls = []
+
+        class Client:
+            def post(self, endpoint, body):
+                calls.append((endpoint, body))
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": "UPID:pve:00001234", "error": None}
+
+            def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        args = self._args()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exit_code = cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(exit_code, cli.EXIT_SUCCESS)
+        self.assertEqual(calls[0][0], "/nodes/pve/lxc")
+        self.assertEqual(calls[0][1]["ssh-public-keys"], "ssh-ed25519 AAAA test@host")
+        self.assertEqual(calls[1][0], "/nodes/pve/lxc/90001/template")
+
+    def test_template_conversion_failure_is_reported(self):
+        class Client:
+            def post(self, endpoint, body):
+                if endpoint.endswith("/template"):
+                    return {"ok": False, "status_code": 500, "duration_ms": 1,
+                            "data": None, "error": "unable to open template"}
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": "UPID:pve:00001234", "error": None}
+
+            def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        args = self._args()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            exit_code = cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertNotEqual(exit_code, cli.EXIT_SUCCESS)
+
+    def test_without_flag_no_template_call(self):
+        calls = []
+
+        class Client:
+            def post(self, endpoint, body):
+                calls.append(endpoint)
+                return {"ok": True, "status_code": 200, "duration_ms": 1,
+                        "data": "UPID:pve:00001234", "error": None}
+
+            def get(self, endpoint):
+                if "/tasks/" in endpoint:
+                    return {"ok": True, "status_code": 200, "duration_ms": 1,
+                            "data": {"status": "stopped", "exitstatus": "OK"}, "error": None}
+                return {"ok": True, "status_code": 200, "duration_ms": 1, "data": {}, "error": None}
+
+        args = self._args(as_template=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.cmd_lxc_create(args, self._config(), Client(), cli.Logger(None, no_log=True))
+        self.assertEqual(calls, ["/nodes/pve/lxc"])
 
 
 class TemplateRegistryTests(unittest.TestCase):

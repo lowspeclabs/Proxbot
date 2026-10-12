@@ -122,6 +122,134 @@ Dangerous operations require stronger guards.
 python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py vm stop --node <node> --vmid 101 --execute --force --confirm 101
 ```
 
+## Running Commands Inside a Container
+
+The Proxmox REST API has **no exec endpoint for LXC**. Its subdir index is
+`clone config firewall interfaces migrate pending resize rrd rrddata snapshot
+spiceproxy status termproxy vncproxy vncwebsocket` — there is no `exec` and no
+`mount`. So there are three ways to run a command in a container, and they are
+not equally good.
+
+| Transport | Needs | Reliability | Use for |
+|---|---|---|---|
+| Guest SSH | Guest IP + installed key | Good | Primary |
+| `pct exec` | Node SSH access | Good | Out-of-band fallback, and the only path that works with no guest networking |
+| Console (`termproxy`) | A getty, and nobody else attached | Poor | Human debugging only |
+
+### Guest SSH
+
+Requires the guest to have a resolvable IP and an installed key. Check with:
+
+```bash
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc status --node <node> --vmid <id>
+```
+
+If the guest IP is missing, wrong, or collides with another host, this transport
+silently fails. Confirm the address is the container's and not a node's before
+trusting it.
+
+### `pct exec` over node SSH
+
+`pct exec` runs on the node, so reaching it means SSH to the node. Configure it
+in `.env` — a key or a password, not both needed:
+
+```dotenv
+PROXMOX_NODE_SSH_USER=root
+PROXMOX_NODE_SSH_KEY=/path/to/node_key
+# or
+PROXMOX_NODE_SSH_PASSWORD=...
+```
+
+Leave them unset and host-side execution is completely disabled; `pct exec` then
+refuses with `node_ssh_unconfigured` rather than attempting anything. Confirm
+what is actually usable with:
+
+```bash
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py doctor --live --node-access
+```
+
+`doctor` always reports which of the three transports are available. The
+`--node-access` probe runs `pct version` over node SSH per node and tells you
+whether `pct exec` will work, with the reason when it will not.
+
+Then:
+
+```bash
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc pct-exec --node <node> --vmid <id> --command "systemctl is-active nginx" --execute
+```
+
+The remote command is assembled by the harness as
+`pct exec <vmid> -- /bin/sh -lc <command>`. The `vmid` is validated numeric
+because it is interpolated into that command line, and the `command` is quoted so
+it cannot split into a second command. You cannot override the node, the `pct`
+invocation, or the shell.
+
+**Secrets.** `--node-password` is visible in the process table to other local
+users. Prefer `PROXMOX_NODE_SSH_KEY`. The chat harness never uses argv: it
+collects the password with `getpass` and hands it to the CLI on an inherited pipe
+descriptor (`--node-password-fd`), so the secret appears in neither argv nor the
+environment. It is cached in memory for the session only, reused so you are not
+asked once per command, and dropped by `clear_history`.
+
+Node access is a significant privilege, so it is off by default and separately
+gated. Prefer an unprivileged account scoped to the containers you need over
+`root`. `ssh exec` refuses Proxmox node targets unless they are listed in
+`PROXMOX_NODE_SSH_TARGETS`, so the model cannot route around the `pct exec`
+allowlist with a generic SSH call.
+
+### Console (opt-in)
+
+The LXC console is a **single shared pty**. Attaching can land on a human's live
+shell, and nothing in the stream identifies whose session it is. On Debian 13
+containers it is usually blank anyway: systemd 257's `console-getty.service` and
+`container-getty@.service` carry `ImportCredential` directives that fail inside
+LXC, so no login prompt appears. `lxc fix-console` prints the drop-in fix.
+
+`lxc exec` therefore **never** falls back to the console implicitly. Pass
+`--console` to allow it, only when you have confirmed no other session is
+attached:
+
+```bash
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc exec --node <node> --vmid <id> --command "uptime" --execute
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc exec --node <node> --vmid <id> --command "uptime" --execute --console
+```
+
+Without `--console`, a failed SSH attempt returns `console_not_requested`. If you
+do opt in and the result cannot be verified, the CLI reports `output_lost` with
+`exit_code: null`. It never reports a missing exit status as `0`, because a false
+success is worse for an agent than an honest unknown.
+
+### Building a keyed base template
+
+`lxc create` accepts `--ssh-public-keys`/`--ssh-keygen`, but `lxc clone` does
+not — so a clone can only be reachable if the key was baked into the template.
+`--as-template` closes that loop:
+
+```bash
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc create \
+  --node <node> --vmid <id> --hostname proxbot-base \
+  --ostemplate local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst \
+  --storage <store> --ssh-public-keys "$(cat ~/.ssh/lxc-base.pub)" \
+  --as-template --execute --wait
+
+python3 ~/.config/opencode/skills/proxmox-manager/scripts/Proxmox-cli.py lxc clone \
+  --node <node> --vmid <id> --new-vmid <new> --hostname <name> --execute --wait
+```
+
+Clones then arrive with guest SSH working, so neither a console login nor node
+access is needed for ordinary work. This is the recommended path when you do not
+want to grant node SSH at all. `ssh-public-keys` is redacted in dry-run output as
+key material, so confirm against your local `.pub` file.
+
+## Reading Output
+
+`✓` means the command ran and reported success. `✗` means it failed. `!` in
+yellow means the only thing reported was routine `ssh(1)` chatter — a known-hosts
+notice or a missing identity file — which is not a failure. The harness also
+passes `LogLevel=ERROR` to `ssh`, so the "Permanently added ..." notice does not
+fire on every connection: `UserKnownHostsFile=/dev/null` means the host key is
+never remembered, so the notice carried no information.
+
 ## Console Broker
 
 `scripts/Proxmox-console.py` is a separate, opt-in broker for VM console access. It never exposes raw VNC tickets to the agent and enforces tiered permissions:

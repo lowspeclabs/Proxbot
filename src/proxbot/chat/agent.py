@@ -12,7 +12,8 @@ try:
 except ImportError:
     requests = None
 
-from .markdown import CYAN, GRAY, GREEN, RED, RESET, YELLOW
+from ..common.redact import redact_command_secrets
+from .markdown import CYAN, GRAY, GREEN, RED, RESET, YELLOW, prompt_input
 from .executor import ProxmoxToolExecutor
 from .safety import SafetyGate
 from .session import SessionLogger
@@ -55,6 +56,7 @@ Templates in Proxmox:
 Guidelines:
 • Always execute the appropriate tool calls directly. The chat interface will automatically handle interactive safety approvals with the user.
 • For lxc_exec: call WITHOUT password/user args. If the container needs login, the harness securely prompts via getpass and retries. NEVER ask the user to paste a password into chat (it would persist in logs/history).
+• For ssh_exec: call WITHOUT password. On authentication failure the harness stops and prompts the operator for a corrected user, key file, or password, then retries once. NEVER retry the same failed credentials in a loop; wait for the operator.
 • Never call vm_guest_network on an LXC vmid — use lxc_status/lxc_config (LXCs have no qemu-server conf). If a tool fails with a type error, switch to the matching vm_* vs lxc_* tool instead of retrying.
 • Run ONE in-guest probe first (e.g. `cat /etc/os-release`) before firing parallel exec batches; exec can block 10-60s per call.
 • Present data in clean Markdown tables with column alignments.
@@ -84,11 +86,16 @@ Guidelines:
             {"role": "system", "content": self.SYSTEM_PROMPT}
         ]
         self.watchdog = LoopWatchdog()
+        # Node SSH passwords collected by getpass, keyed by node. Session
+        # lifetime only: never persisted, never logged, never placed in the
+        # message history, and not carried across clear_history().
+        self._node_prompts: Dict[str, str] = {}
 
     def clear_history(self) -> None:
         """Reset conversation context while keeping the system prompt."""
         self.messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
         self.watchdog = LoopWatchdog()
+        self._node_prompts.clear()
 
     def _prune_history(self) -> None:
         """Prune older tool response payloads to prevent context overflow."""
@@ -98,6 +105,67 @@ Guidelines:
                 if msg.get("role") == "tool" and isinstance(msg.get("content"), str):
                     if len(msg["content"]) > 1000:
                         msg["content"] = msg["content"][:1000] + "... [Older tool output truncated for context]"
+
+    # Benign notices that ssh(1) writes to stderr on every connection because of
+    # how this harness invokes it (UserKnownHostsFile=/dev/null, so the host key
+    # is never actually remembered). They are not failures and must not be
+    # rendered as one. Matched per line: every non-blank line of the reported
+    # detail must be benign for the result to count as a warning.
+    _BENIGN_SSH_NOTICE_RE = re.compile(
+        r"(?i)^(?:"
+        r"warning:\s*permanently added .* to the list of known hosts\.?"
+        r"|pseudo-terminal will not be allocated because stdin is not a terminal\.?"
+        r"|warning:\s*identity file .* not accessible:.*"
+        r"|the authenticity of host .* can't be established\..*"
+        r"|host key verification failed\.?"
+        r")$"
+    )
+
+    def _is_benign_notice(self, result: Dict[str, Any]) -> bool:
+        """True when every reported detail, across every populated field, is SSH chatter."""
+        checked = False
+        for key in ("error", "stderr", "raw_output"):
+            value = result.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            checked = True
+            for line in value.splitlines():
+                if line.strip() and not self._BENIGN_SSH_NOTICE_RE.match(line.strip()):
+                    return False
+        return checked
+
+    # Credential rejections from ssh(1). Kept distinct from benign notices:
+    # these mean the key/user/password was wrong and retrying identically
+    # will fail again, so the harness must stop and ask the operator.
+    _SSH_AUTH_FAILED_RE = re.compile(
+        r"(?i)(?:"
+        r"permission denied\s*\(publickey"
+        r"|permission denied.*password"
+        r"|authentication fail"
+        r"|no more authentication methods"
+        r"|invalid format.*identity|load key.*invalid"
+        r")"
+    )
+
+    def _is_ssh_auth_failure(self, result: Dict[str, Any]) -> bool:
+        """True when an ssh_exec result is a credential rejection, not noise."""
+        if result.get("ok"):
+            return False
+        if result.get("status") in ("ssh_auth_failed", "node_target_refused"):
+            return result.get("status") == "ssh_auth_failed"
+        texts: List[str] = []
+        for key in ("error", "stderr", "raw_output"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+        data = result.get("data")
+        if isinstance(data, dict):
+            for key in ("stderr", "stdout"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    texts.append(value)
+        blob = "\n".join(texts)
+        return bool(blob and self._SSH_AUTH_FAILED_RE.search(blob))
 
     def _extract_error_detail(self, result: Dict[str, Any]) -> str:
         """Extract a clean, concise error summary string from a tool result."""
@@ -372,9 +440,12 @@ Guidelines:
                     if name == "lxc_exec" and _is_login_required(result):
                         target_node = args.get("node", "N/A")
                         target_vmid = args.get("vmid", "N/A")
+                        # executor.py only emits --user when the model set it, so
+                        # an absent/empty value resolves to the CLI default (root).
+                        target_user = args.get("user") or "root"
                         print(f"\n  {YELLOW}Login required for {target_vmid} on {target_node}.{RESET}")
                         try:
-                            pwd = getpass.getpass(f"  Password for root@{target_node}:{target_vmid} (Enter to cancel): ")
+                            pwd = getpass.getpass(f"  Password for {target_user}@{target_node}:{target_vmid} (Enter to cancel): ")
                         except (EOFError, KeyboardInterrupt):
                             pwd = ""
 
@@ -386,12 +457,120 @@ Guidelines:
                             result = self.executor.execute(name, auth_args)
                             duration = time.time() - t0
 
+                    # Node password escalation for the pct exec transport. Kept
+                    # in memory for the session only, passed over a pipe fd
+                    # rather than argv, and never logged or put in the message
+                    # history — the retry does not echo it back at all.
+                    node_secret: str | None = None
+                    if name == "lxc_pct_exec" and result.get("status") == "node_password_required":
+                        target_node = args.get("node") or "the configured node"
+                        target_user = (result.get("data") or {}).get("user") or "root"
+                        cached = self._node_prompts.get(target_node)
+                        if cached:
+                            node_secret = cached
+                        else:
+                            try:
+                                pwd = getpass.getpass(
+                                    f"  Node password for {target_user}@{target_node} "
+                                    f"(Enter to cancel): "
+                                )
+                            except (EOFError, KeyboardInterrupt):
+                                pwd = ""
+                            if pwd:
+                                # Reused for the rest of this session so the
+                                # operator is not asked once per command.
+                                self._node_prompts[target_node] = pwd
+                                node_secret = pwd
+
+                        if node_secret:
+                            if not cached:
+                                print(f"  {GRAY}Authenticating…{RESET}")
+                            t0 = time.time()
+                            result = self.executor.execute(name, args, secret=node_secret)
+                            duration = time.time() - t0
+
+                    # SSH auth escalation: on publickey/password denial stop
+                    # the loop and ask the operator for corrected credentials
+                    # instead of letting the model retry the same failing
+                    # user/key. One retry with new creds; on cancel the tool
+                    # result tells the model not to retry.
+                    if name == "ssh_exec" and self._is_ssh_auth_failure(result):
+                        target_host = args.get("host") or (
+                            f"{args.get('node')}/{args.get('vmid')}"
+                            if args.get("vmid") else (args.get("node") or "unknown host")
+                        )
+                        target_user = args.get("user") or "root"
+                        current_key = args.get("key_file")
+                        print(f"\n  {YELLOW}SSH authentication failed for "
+                              f"{target_user}@{target_host}.{RESET}")
+                        print(f"  {GRAY}Enter corrected credentials, or press "
+                              f"Enter/Ctrl-C to stop.{RESET}")
+                        try:
+                            new_user = (prompt_input(f"  SSH user [{target_user}]: ")
+                                        .strip() or target_user)
+                            raw_key = prompt_input(
+                                f"  SSH key file [{current_key or 'none'}] "
+                                f"('none' to clear): "
+                            ).strip()
+                            if raw_key.lower() == "none":
+                                new_key: Optional[str] = None
+                            elif raw_key:
+                                new_key = raw_key
+                            else:
+                                new_key = current_key
+                            new_pass = getpass.getpass(
+                                f"  SSH password for {new_user}@{target_host} "
+                                f"(Enter to skip): "
+                            )
+                        except (EOFError, KeyboardInterrupt):
+                            new_user, new_key, new_pass = target_user, current_key, ""
+                            print()
+
+                        creds_changed = (
+                            new_user != target_user
+                            or (new_key or None) != (current_key or None)
+                            or bool(new_pass)
+                        )
+                        if creds_changed:
+                            print(f"  {GRAY}Retrying with updated credentials…{RESET}")
+                            auth_args = dict(args)
+                            auth_args["user"] = new_user
+                            if new_key:
+                                auth_args["key_file"] = new_key
+                            else:
+                                auth_args.pop("key_file", None)
+                            if new_pass:
+                                auth_args["password"] = new_pass
+                            else:
+                                # Do not silently reuse a wrong password.
+                                auth_args.pop("password", None)
+                            t0 = time.time()
+                            result = self.executor.execute(name, auth_args)
+                            duration = time.time() - t0
+                        else:
+                            result = dict(result)
+                            result["status"] = "ssh_auth_failed"
+                            result["error"] = (
+                                f"SSH authentication failed for "
+                                f"{target_user}@{target_host}: Permission denied "
+                                f"(publickey,password). Do NOT retry the same "
+                                f"credentials in a loop. Ask the operator for the "
+                                f"correct SSH user, key file (--key-file), or "
+                                f"password, then run ssh_exec once with the "
+                                f"corrected values."
+                            )
+
                     is_ok = result.get("ok", False)
                     if is_ok:
                         print(f"  {GREEN}✓{RESET} {GRAY}{duration:.1f}s{RESET}")
                     else:
                         err_msg = self._extract_error_detail(result)
-                        print(f"  {RED}✗ {err_msg}{RESET} {GRAY}({duration:.1f}s){RESET}")
+                        # Routine ssh(1) chatter is not a failure; reserve the red
+                        # cross for real faults.
+                        if self._is_benign_notice(result):
+                            print(f"  {YELLOW}! {err_msg}{RESET} {GRAY}({duration:.1f}s){RESET}")
+                        else:
+                            print(f"  {RED}✗ {err_msg}{RESET} {GRAY}({duration:.1f}s){RESET}")
 
                     # Sanitize result to ensure password never enters logs or messages.
                     # _redact() already runs inside logger.log, but the tool message
@@ -404,16 +583,12 @@ Guidelines:
                         if isinstance(sanitized_result.get("data"), dict) and "password" in sanitized_result["data"]:
                             sanitized_result["data"]["password"] = "***REDACTED***"
                         if isinstance(sanitized_result.get("command"), str):
-                            sanitized_result["command"] = re.sub(
-                                r"(?i)(--password|--token-secret|--api-token-secret|--secret|--private-key)(\s+|=)(\"[^\"]*\"|'[^']*'|\S+)",
-                                r"\1\2***REDACTED***",
-                                sanitized_result["command"],
+                            sanitized_result["command"] = redact_command_secrets(
+                                sanitized_result["command"]
                             )
                         if isinstance(sanitized_result.get("error"), str):
-                            sanitized_result["error"] = re.sub(
-                                r"(?i)(--password|--token-secret|--api-token-secret|--secret|--private-key)(\s+|=)(\"[^\"]*\"|'[^']*'|\S+)",
-                                r"\1\2***REDACTED***",
-                                sanitized_result["error"],
+                            sanitized_result["error"] = redact_command_secrets(
+                                sanitized_result["error"]
                             )
 
                     self.logger.log("TOOL_RESULT", {"tool": name, "result": sanitized_result, "duration_s": duration})

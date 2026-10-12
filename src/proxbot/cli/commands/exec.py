@@ -39,6 +39,16 @@ from ...common.safety import emit_dry_run, request_plan, require_destructive, re
 from ._shared import _exit_code_for, _extract_task, _require_config, _wait_for_task
 from .vm import _diagnose_vm_agent
 
+# Unambiguous console credential prompts. Used to stop the probe early: these
+# tokens only appear when a real getty/login is on the other end.
+_CONSOLE_CREDENTIAL_PROMPT_RE = re.compile(r"(?:login|username|password)\s*:", re.IGNORECASE)
+
+# What agetty/PAM print when the credential is refused.
+_CONSOLE_REJECTED_RE = re.compile(
+    r"login incorrect|authentication failure|access denied|permission denied",
+    re.IGNORECASE,
+)
+
 
 def lxc_exec(
     node: str,
@@ -163,27 +173,66 @@ def lxc_exec(
             sock.close()
             return None
 
-        # Probe console with a newline to inspect active state
+        # Probe console with a newline to inspect active state. Wait on an idle
+        # deadline rather than a frame count: a slow getty must not be reported
+        # as a silent console, and a silent console must not be reported as a
+        # login prompt.
         sock.sendall(encode_frame(b"\n\n"))
-        time.sleep(0.3)
 
         initial_buf = b""
-        sock.settimeout(1.5)
-        for _ in range(8):
+        sock.settimeout(1.0)
+        idle_deadline = time.time() + 2.0
+        empty_reads = 0
+        while time.time() < idle_deadline:
             try:
                 f = read_frame(sock)
-                if f:
-                    initial_buf += f
             except Exception:
+                # Socket timeout with no data: keep waiting until the console has
+                # been idle for the full window before calling it silent.
+                continue
+            if not f:
+                empty_reads += 1
+                if empty_reads >= 3:
+                    break
+                continue
+            empty_reads = 0
+            initial_buf += f
+            idle_deadline = time.time() + 2.0
+            if _CONSOLE_CREDENTIAL_PROMPT_RE.search(
+                strip_ansi(initial_buf.decode("utf-8", errors="replace"))
+            ):
                 break
 
         initial_text = strip_ansi(initial_buf.decode("utf-8", errors="replace")).strip()
-        is_active_shell = bool(re.search(r"(?:[#\$>~#~]|root@[^\s:]+:[^#]+#)\s*$", initial_text))
+        is_active_shell = bool(re.search(r"(?:[#\$>~]|root@[^\s:]+:[^#]+#)\s*$", initial_text))
         login_prompt_detected = bool(re.search(r"(?:login|username)\s*:\s*$", initial_text, re.IGNORECASE))
         password_prompt_detected = bool(re.search(r"password\s*:\s*$", initial_text, re.IGNORECASE))
+        prompt_detected = login_prompt_detected or password_prompt_detected
 
-        # Case 1: Active root shell is NOT present and no password was provided
-        if not is_active_shell and not password:
+        def _no_console_login(reason: str) -> dict[str, Any]:
+            """No credential prompt was observed, so no credential was tested."""
+            sock.close()
+            return {
+                "ok": False,
+                "status": "console_unavailable",
+                "vmid": vmid,
+                "node": node,
+                "error": (
+                    f"Container {vmid}: no login or password prompt was received on this console "
+                    f"attachment, so {reason} The LXC console is a single shared pty whose prompt is "
+                    f"not reliably replayed on attach, and another session may hold it, so this is "
+                    f"not evidence of a bad password. Verify from inside the guest with "
+                    f"`systemctl is-active getty@tty1`. For automated commands use SSH, or "
+                    f"`pct exec {vmid} -- <cmd>` from the node."
+                ),
+                "method": "termproxy",
+            }
+
+        # Case 1: no password supplied. Only ask for one when a prompt is really
+        # there to answer — otherwise the password would be typed into a void.
+        if not password and not is_active_shell:
+            if not prompt_detected:
+                return _no_console_login("no credential was requested.")
             sock.close()
             prompt_str = initial_text.split("\n")[-1] if initial_text else f"LXC {vmid} login:"
             return {
@@ -196,8 +245,11 @@ def lxc_exec(
                 "method": "termproxy",
             }
 
-        # Case 2: Password provided -> perform console login
+        # Case 2: password supplied -> perform console login against a real prompt
         if password:
+            if not prompt_detected:
+                return _no_console_login(f"the supplied password was not submitted.")
+
             if login_prompt_detected or not password_prompt_detected:
                 sock.sendall(encode_frame(f"{user or 'root'}\r\n".encode("utf-8")))
                 pw_buf = b""
@@ -222,13 +274,15 @@ def lxc_exec(
             sock.settimeout(4.0)
             start_chk = time.time()
             login_success = False
+            login_rejected = False
             while (time.time() - start_chk) < 4.0:
                 try:
                     f = read_frame(sock)
                     if f:
                         auth_chk_buf += f
                         chk_text = strip_ansi(auth_chk_buf.decode("utf-8", errors="replace"))
-                        if "Login incorrect" in chk_text:
+                        if _CONSOLE_REJECTED_RE.search(chk_text):
+                            login_rejected = True
                             break
                         if any(chk_text.rstrip().endswith(s) for s in ("#", "$", "~#", "~$", ">")):
                             login_success = True
@@ -238,12 +292,17 @@ def lxc_exec(
 
             if not login_success:
                 sock.close()
+                error = (
+                    f"Console login rejected by container {vmid} — wrong username or password."
+                    if login_rejected
+                    else f"Container {vmid} accepted the credentials but no shell prompt appeared within 4s."
+                )
                 return {
                     "ok": False,
                     "status": "login_failed",
                     "vmid": vmid,
                     "node": node,
-                    "error": "Console login failed (incorrect password or login timed out).",
+                    "error": error,
                     "method": "termproxy",
                 }
 
@@ -288,23 +347,76 @@ def lxc_exec(
         sock.close()
 
         text_out = collected.decode("utf-8", errors="replace")
-        if beg_marker in text_out and end_marker in text_out:
-            part = text_out.split(beg_marker, 1)[1]
-            cmd_body, _, end_part = part.partition(end_marker)
-            code_match = re.search(r":([0-9]+)", end_part)
-            exit_code = int(code_match.group(1)) if code_match else 0
-            clean_stdout = strip_ansi(cmd_body).strip()
-            return {
-                "ok": exit_code == 0,
-                "exit_code": exit_code,
-                "stdout": clean_stdout,
-                "stderr": "",
-                "method": "termproxy_authenticated" if password else "termproxy",
-            }
+        return _parse_console_output(text_out, beg_marker, end_marker, vmid, node, timeout, bool(password))
     except Exception:
         pass
 
     return None
+
+
+def _parse_console_output(
+    text_out: str,
+    beg_marker: str,
+    end_marker: str,
+    vmid: str,
+    node: str,
+    timeout: int,
+    authenticated: bool,
+) -> dict[str, Any]:
+    """Fail closed on console output.
+
+    A shared/limited terminal can lose the boundary markers or the trailing
+    exit status. Reporting a missing exit status as 0 tells the agent a failed
+    command succeeded, which is worse than reporting that we do not know.
+    """
+    method = "termproxy_authenticated" if authenticated else "termproxy"
+
+    def _lost(reason: str, observed: str = "") -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "output_lost",
+            "vmid": vmid,
+            "node": node,
+            "error": (
+                f"Container {vmid}: the command was sent to the console but its result could "
+                f"not be verified — {reason}. The console is a shared terminal, so output can "
+                f"scroll past or interleave with another session. The exit status is UNKNOWN; "
+                f"do not assume the command succeeded. Re-run over SSH, or "
+                f"`pct exec {vmid} -- <cmd>` from the node."
+            ),
+            "observed": observed,
+            "exit_code": None,
+            "method": method,
+        }
+
+    if beg_marker not in text_out:
+        return _lost("the start marker was never observed, so the command may not have run at all")
+
+    part = text_out.split(beg_marker, 1)[1]
+    cmd_body, found_end, end_part = part.partition(end_marker)
+    clean_stdout = strip_ansi(cmd_body).strip()
+
+    if not found_end:
+        return _lost(
+            "the end marker was never observed, so the exit status is unknown",
+            observed=clean_stdout[-2000:],
+        )
+
+    code_match = re.match(r"\s*:([0-9]+)", end_part)
+    if not code_match:
+        return _lost(
+            "the exit status was truncated, so the exit code is unknown",
+            observed=clean_stdout[-2000:],
+        )
+
+    exit_code = int(code_match.group(1))
+    return {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "stdout": clean_stdout,
+        "stderr": "",
+        "method": method,
+    }
 
 
 def _run_ssh_command(
@@ -321,7 +433,12 @@ def _run_ssh_command(
         "ssh",
         "-p", str(port),
         "-o", "StrictHostKeyChecking=accept-new",
+        # With UserKnownHostsFile=/dev/null the host key is never actually
+        # remembered, so "Permanently added ..." fires on every single
+        # connection and tells the operator nothing. LogLevel=ERROR suppresses
+        # that notice (and nothing at ERROR or above).
         "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
         "-o", "ConnectTimeout=10",
     ]
     if key_file and pathlib.Path(key_file).exists():
@@ -382,7 +499,18 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
     endpoint = f"/nodes/{node}/lxc/{vmid}/termproxy"
     guard = require_execute(args, f"lxc_exec:{node}:{vmid}")
     if guard is not None:
-        return emit_dry_run(args, logger, request_plan("TERMPROXY", endpoint, {"command": command}, {"node": node, "vmid": vmid, "command": command}))
+        return emit_dry_run(args, logger, request_plan(
+            "LXC EXEC",
+            endpoint,
+            {"command": command, "user": user, "console": bool(getattr(args, "console", False))},
+            {
+                "node": node,
+                "vmid": vmid,
+                "command": command,
+                "transports": ["ssh"] + (["termproxy"] if getattr(args, "console", False) else []),
+                "console_note": "termproxy is opt-in only; pass --console to allow the shared-pty fallback",
+            },
+        ))
 
     # 1. If password is provided or SSH key exists, attempt SSH first (quietly —
     # the fallback must emit exactly ONE final JSON document, otherwise chat.py
@@ -422,10 +550,27 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
                 }, args.format, title=f"LXC {vmid} Exec (ssh)")
             return EXIT_SUCCESS
 
-    # 2. Try execution via Proxmox termproxy WebSocket API
+    # 2. Console (termproxy) is opt-in only. The LXC console is a single shared
+    # pty: attaching can land on a human's live shell, and ProxBot cannot tell
+    # whose session it found. Without --console the operator has asserted that
+    # nobody else holds it, so we never attach implicitly.
+    if not getattr(args, "console", False):
+        emit_output({
+            "ok": False,
+            "status": "console_not_requested",
+            "data": {"vmid": vmid, "node": node, "transport": "none"},
+            "error": (
+                f"No usable exec transport for container {vmid} on {node}. SSH into the guest was "
+                f"unavailable, and the console is opt-in because it is a single shared pty that may "
+                f"belong to someone else. Re-run with --console if you have confirmed nobody else is "
+                f"attached, or use `pct exec {vmid} -- <cmd>` from the node."
+            ),
+        }, args.format, title=f"LXC {vmid} Exec (console_not_requested)")
+        return EXIT_INTERNAL
+
     term_res = lxc_exec(node, vmid, command, timeout, config, client, logger, user=user, password=password, auto_inject_key=auto_inject_key, key_file=key_file)
     if term_res is not None:
-        if term_res.get("status") in ("login_required", "login_failed"):
+        if term_res.get("status") in ("login_required", "login_failed", "console_unavailable", "output_lost"):
             # If password was provided and both termproxy and SSH failed
             emit_output({
                 "ok": False,
@@ -458,14 +603,20 @@ def cmd_lxc_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
         emit_output(result, args.format, title=f"LXC {vmid} Exec (termproxy)")
         return EXIT_SUCCESS if term_res["ok"] else EXIT_INTERNAL
 
-    # 3. Final fallback: If no password and not logged in, ask for login
+    # 3. The termproxy transport itself never came up: no ticket, no WebSocket
+    # upgrade, or a broken frame stream. Distinct from output_lost, where the
+    # session worked and the result could not be read back.
     emit_output({
         "ok": False,
-        "status": "login_required",
-        "data": {"vmid": vmid, "node": node, "status": "login_required"},
-        "error": f"Container {vmid} console requires login credentials to establish in-guest access.",
-    }, args.format, title=f"LXC {vmid} Exec (login_required)")
-    return EXIT_AUTH
+        "status": "console_unavailable",
+        "data": {"vmid": vmid, "node": node, "status": "console_unavailable"},
+        "error": (
+            f"Could not open a termproxy WebSocket to container {vmid} on {node} "
+            f"(no ticket, no upgrade, or the frame stream failed). This is a transport "
+            f"failure, not a credential problem."
+        ),
+    }, args.format, title=f"LXC {vmid} Exec (console_unavailable)")
+    return EXIT_INTERNAL
 
 
 def _resolve_guest_ip(node: str, vmid: str, kind: str | None, client: ProxmoxClient | None) -> str | None:
@@ -524,6 +675,58 @@ def _resolve_guest_ip(node: str, vmid: str, kind: str | None, client: ProxmoxCli
     return None
 
 
+def _node_addresses_for_target(client: ProxmoxClient | None) -> dict[str, str]:
+    """node name -> IPv4 address, reusing the pct exec transport's resolution."""
+    from .nodessh import _node_addresses
+
+    try:
+        return _node_addresses(client)
+    except Exception:
+        return {}
+
+
+def _blocked_node_target(
+    host: str,
+    node: str | None,
+    config: Config,
+    client: ProxmoxClient | None,
+) -> str | None:
+    """Return the matched node name if `host` is a Proxmox node, else None.
+
+    Matches on cluster node names, their resolved addresses, and the configured
+    default node. An explicitly allowed target is never blocked.
+    """
+    target = str(host).strip().lower()
+    if not target:
+        return None
+
+    allowed = {str(item).strip().lower() for item in config.node_ssh_targets}
+    if target in allowed:
+        return None
+
+    candidates: dict[str, str] = {}
+    if node:
+        candidates[str(node).strip().lower()] = str(node)
+    for name, address in _node_addresses_for_target(client).items():
+        candidates[name.strip().lower()] = name
+        candidates[address.strip().lower()] = name
+    if config.default_node:
+        candidates[str(config.default_node).strip().lower()] = str(config.default_node)
+
+    if target in candidates:
+        return candidates[target]
+
+    # A node name may also be reachable as a bare or FQDN form; compare the
+    # short label and any address followed by a domain suffix.
+    short = target.split(".")[0]
+    if short in candidates:
+        return candidates[short]
+    for name, address in _node_addresses_for_target(client).items():
+        if address and target.startswith(address + "."):
+            return name
+    return None
+
+
 def cmd_ssh_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient, logger: Logger, emit: bool = True) -> int:
     """Execute SSH command. When emit=False (internal fallback from lxc exec),
     stay silent so the caller can emit a single final JSON document."""
@@ -549,6 +752,27 @@ def cmd_ssh_exec(args: argparse.Namespace, config: Config, client: ProxmoxClient
     if not command:
         _emit_err("validation", "--command is required", "Provide a non-empty shell command to execute.")
         return EXIT_VALIDATION
+
+    # A Proxmox node is root on the hypervisor. `ssh exec` is a generic tool, so
+    # without this guard the model can route around the pct exec allowlist by
+    # aiming a plain SSH call at a node. Node targets must be named explicitly.
+    if host:
+        blocked = _blocked_node_target(host, node, config, client)
+        if blocked is not None:
+            _emit({
+                "ok": False,
+                "status": "node_target_refused",
+                "data": {"host": host, "node": node, "allowed": config.node_ssh_targets},
+                "error": (
+                    f"Refusing to SSH to {host!r}: it looks like a Proxmox node. `ssh exec` is a "
+                    f"generic tool and must not be usable as a host shell, or the pct exec "
+                    f"allowlist can be bypassed. To reach a container out-of-band use "
+                    f"`lxc pct-exec --vmid <id> --command <cmd>`, which the harness assembles and "
+                    f"validates. To permit direct node SSH, list the target in "
+                    f"PROXMOX_NODE_SSH_TARGETS."
+                ),
+            }, "SSH Exec")
+            return EXIT_SAFETY
 
     # Resolve IP from VM or LXC if --host not explicitly provided
     if not host:
