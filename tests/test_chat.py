@@ -389,6 +389,66 @@ class ToolExecutorArgsTests(unittest.TestCase):
         self.assertNotIn("lxc_set_config", chat.READ_ONLY_TOOLS)
 
 
+class ClusterSummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.executor = chat.ProxmoxToolExecutor(chat.PROXMOX_CLI_PATH, chat.ENV_PATH)
+
+    def _run(self, raw, args=None):
+        with mock.patch.object(
+            self.executor, "_raw_execute",
+            side_effect=lambda cli_args, **kw: raw[tuple(cli_args)],
+        ):
+            return self.executor.execute("cluster_summary", args or {})
+
+    def _raw(self):
+        return {
+            ("nodes", "list"): {"ok": True, "data": [{"node": "pveheavy", "status": "online"}]},
+            ("storage", "list", "--node", "pveheavy"): {"ok": True, "data": [
+                {"storage": "SSDStore", "type": "zfspool", "content": "images,rootdir"},
+            ]},
+            ("network", "list", "--node", "pveheavy"): {"ok": True, "data": [
+                {"iface": "vmbr0", "type": "bridge", "active": 1, "cidr": "192.168.1.55/24"},
+            ]},
+            ("lxcs", "list", "--node", "pveheavy"): {"ok": True, "data": [
+                {"vmid": 109, "name": "web", "status": "running"},
+            ]},
+            ("vms", "list", "--node", "pveheavy"): {"ok": True, "data": []},
+            ("vms", "next-id"): {"ok": True, "data": {"next_id": "110"}},
+        }
+
+    def test_aggregates_nodes_storage_networks_placement_and_next_id(self):
+        result = self._run(self._raw())
+        self.assertTrue(result["ok"])
+        data = result["data"]
+        self.assertEqual(data["nodes"], [{"node": "pveheavy", "status": "online"}])
+        self.assertEqual(data["storage"][0]["suitable_for"], ["LXC rootfs", "VM disks"])
+        self.assertEqual(data["storage"][0]["node"], "pveheavy")
+        self.assertEqual(data["networks"], [
+            {"iface": "vmbr0", "type": "bridge", "active": 1, "cidr": "192.168.1.55/24", "node": "pveheavy"},
+        ])
+        self.assertEqual(data["lxcs"], [
+            {"vmid": 109, "name": "web", "status": "running", "node": "pveheavy"},
+        ])
+        self.assertEqual(data["vms"], [])
+        self.assertEqual(data["next_id"], "110")
+
+    def test_node_filter_limits_scope(self):
+        raw = self._raw()
+        raw[("nodes", "list")] = {"ok": True, "data": [
+            {"node": "pveheavy", "status": "online"},
+            {"node": "pvestore", "status": "online"},
+        ]}
+        result = self._run(raw, {"node": "pveheavy"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["nodes"], [{"node": "pveheavy", "status": "online"}])
+        self.assertTrue(all(s["node"] == "pveheavy" for s in result["data"]["storage"]))
+
+    def test_risk_classification(self):
+        self.assertIn("cluster_summary", chat.READ_ONLY_TOOLS)
+        self.assertNotIn("cluster_summary", chat.WRITE_TOOLS)
+        self.assertNotIn("cluster_summary", chat.DESTRUCTIVE_TOOLS)
+
+
 class NodePasswordPromptTests(unittest.TestCase):
     """The harness collects a node password once per session and keeps it out of argv."""
 
@@ -418,6 +478,7 @@ class NodePasswordPromptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             executor = mock.MagicMock()
             executor.execute.side_effect = [
+                {"ok": True, "data": {"nodes": [{"node": "pveheavy", "status": "online"}]}},
                 {"ok": False, "status": "node_password_required",
                  "data": {"user": "root"}, "error": "needs a password"},
                 {"ok": True, "data": {"exit_code": 0, "stdout": "hello\n"}},
@@ -430,9 +491,9 @@ class NodePasswordPromptTests(unittest.TestCase):
 
             prompt.assert_called_once()
             self.assertIn("root@pveheavy", prompt.call_args[0][0])
-            self.assertEqual(executor.execute.call_count, 2)
+            self.assertEqual(executor.execute.call_count, 3)
             # The secret travels on the dedicated channel, never in arguments.
-            retry = executor.execute.call_args_list[1]
+            retry = executor.execute.call_args_list[2]
             self.assertEqual(retry.kwargs.get("secret"), "node-secret")
             self.assertNotIn("node-secret", json.dumps(retry.args[1]))
 
@@ -464,7 +525,7 @@ class NodePasswordPromptTests(unittest.TestCase):
                 "lxc_pct_exec", {"vmid": 170, "command": "id", "node": "pveheavy"})):
                 with mock.patch("getpass.getpass", return_value=""):
                     agent.chat("run id")
-            self.assertEqual(executor.execute.call_count, 1)
+            self.assertEqual(executor.execute.call_count, 2)
             self.assertEqual(agent._node_prompts, {})
 
     def test_clear_history_drops_the_cached_password(self):
@@ -488,7 +549,8 @@ class NodePasswordPromptTests(unittest.TestCase):
                     agent.chat("run id")
             # lxc_exec's own console escalation is separate; it must not be
             # handed a node secret, and no retry may happen when cancelled.
-            self.assertEqual(executor.execute.call_count, 1)
+            # Call count is 2: the per-request cluster snapshot plus the tool call.
+            self.assertEqual(executor.execute.call_count, 2)
 
 
 class BenignNoticeTests(unittest.TestCase):
@@ -615,7 +677,11 @@ class ChatAgentTests(unittest.TestCase):
             with mock.patch("chat.requests.post", side_effect=[resp1, resp2]):
                 answer = agent.chat("Check nodes status")
                 self.assertIn("The cluster node `pve1` is online.", answer)
-                mock_executor.execute.assert_called_once_with("nodes_list", {})
+                # Per-request cluster snapshot first, then the model's tool call.
+                self.assertEqual(mock_executor.execute.call_args_list, [
+                    mock.call("cluster_summary", {}),
+                    mock.call("nodes_list", {}),
+                ])
                 self.assertEqual(logger.stats["tool_calls"], 1)
                 self.assertEqual(logger.stats["user_prompts"], 1)
 
@@ -623,8 +689,9 @@ class ChatAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             logger = chat.SessionLogger(pathlib.Path(tmpdir))
             mock_executor = mock.MagicMock()
-            # First call returns login_required, second call (with password) returns success
+            # Snapshot fetch first, then login_required, then success with password.
             mock_executor.execute.side_effect = [
+                {"ok": True, "data": {"nodes": [{"node": "pveheavy", "status": "online"}]}},
                 {"ok": False, "status": "login_required", "prompt": "netbox login: "},
                 {"ok": True, "data": {"stdout": "Linux 6.8\n", "exit_code": 0}}
             ]
@@ -671,10 +738,10 @@ class ChatAgentTests(unittest.TestCase):
                  mock.patch("getpass.getpass", return_value="mysecretpass"):
                 answer = agent.chat("run uname on netbox")
                 self.assertIn("Command executed: Linux 6.8", answer)
-                self.assertEqual(mock_executor.execute.call_count, 2)
-                # Second call should have password passed
-                second_call_args = mock_executor.execute.call_args_list[1]
-                self.assertEqual(second_call_args[0][1]["password"], "mysecretpass")
+                self.assertEqual(mock_executor.execute.call_count, 3)
+                # Third call (snapshot + tool + retry) should have password passed
+                third_call_args = mock_executor.execute.call_args_list[2]
+                self.assertEqual(third_call_args[0][1]["password"], "mysecretpass")
 
     def test_build_cli_args_vm_exec(self):
         executor = chat.ProxmoxToolExecutor(cli_path=pathlib.Path("/tmp/fake-cli.py"), env_path=pathlib.Path("/tmp/fake.env"))
@@ -731,7 +798,68 @@ class ChatAgentTests(unittest.TestCase):
             with mock.patch("chat.requests.post", side_effect=[resp1, resp2]):
                 answer = agent.chat("run uname -a on vm 105")
                 self.assertIn("VM 105 kernel is Linux debian-vm 6.1.0", answer)
-                mock_executor.execute.assert_called_once_with("vm_exec", {"node": "pveheavy", "vmid": 105, "command": "uname -a"})
+                self.assertEqual(mock_executor.execute.call_args_list, [
+                    mock.call("cluster_summary", {}),
+                    mock.call("vm_exec", {"node": "pveheavy", "vmid": 105, "command": "uname -a"}),
+                ])
+
+    def _snapshot_agent(self, tmpdir, snapshot_result):
+        logger = chat.SessionLogger(pathlib.Path(tmpdir))
+        mock_executor = mock.MagicMock()
+        mock_executor.execute.return_value = snapshot_result
+        gate = chat.SafetyGate(auto_approve=True)
+        agent = chat.ChatAgent(
+            base_url="http://mock-llm:1234/v1",
+            api_key="test-key",
+            model="test-model",
+            temperature=0.1,
+            max_turns=3,
+            executor=mock_executor,
+            safety_gate=gate,
+            logger=logger,
+        )
+        return agent
+
+    def _final_answer_responses(self, text, count):
+        payload = json.dumps({"choices": [{"delta": {"content": text}}]})
+        responses = []
+        for _ in range(count):
+            r = mock.MagicMock()
+            r.status_code = 200
+            r.iter_lines.return_value = [f"data: {payload}".encode(), b"data: [DONE]"]
+            responses.append(r)
+        return responses
+
+    def _snapshot_messages(self, agent):
+        return [
+            m for m in agent.messages
+            if m.get("role") == "system"
+            and isinstance(m.get("content"), str)
+            and m["content"].startswith("[Cluster snapshot")
+        ]
+
+    def test_cluster_snapshot_injected_and_replaced_each_request(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._snapshot_agent(tmpdir, {
+                "ok": True,
+                "data": {"nodes": [{"node": "pveheavy", "status": "online"}]},
+            })
+            with mock.patch("chat.requests.post",
+                             side_effect=self._final_answer_responses("ok", 2)):
+                agent.chat("first")
+                agent.chat("second")
+            snapshots = self._snapshot_messages(agent)
+            self.assertEqual(len(snapshots), 1)
+            self.assertIn("pveheavy", snapshots[0]["content"])
+
+    def test_failed_snapshot_does_not_block_chat(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            agent = self._snapshot_agent(tmpdir, {"ok": False, "error": "api down"})
+            with mock.patch("chat.requests.post",
+                             side_effect=self._final_answer_responses("still here", 1)):
+                answer = agent.chat("hello")
+            self.assertIn("still here", answer)
+            self.assertEqual(self._snapshot_messages(agent), [])
 
 
 class ModelResolutionTests(unittest.TestCase):

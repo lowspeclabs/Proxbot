@@ -10,6 +10,25 @@ from typing import Any, Dict, List, Optional
 from .spec import HARNESS_ASSEMBLED_TOOLS
 from .watchdog import validate_harness_command
 
+
+def _annotate_storage_pool(st: dict, node: str) -> dict:
+    """Add node attribution and a suitable_for capability list to a storage row."""
+    st.setdefault("node", node)
+    content_str = st.get("content", "")
+    supports = []
+    if "rootdir" in content_str:
+        supports.append("LXC rootfs")
+    if "images" in content_str:
+        supports.append("VM disks")
+    if "vztmpl" in content_str:
+        supports.append("LXC Templates")
+    if "iso" in content_str:
+        supports.append("ISO Images")
+    if "backup" in content_str:
+        supports.append("Backups")
+    st["suitable_for"] = supports
+    return st
+
 class ProxmoxToolExecutor:
     """Executes tools by invoking scripts/Proxmox-cli.py as a subprocess."""
 
@@ -461,22 +480,7 @@ class ProxmoxToolExecutor:
                             if unique_key in seen_pools:
                                 continue
                             seen_pools.add(unique_key)
-                            st.setdefault("node", n)
-                            # Annotate what this storage pool supports
-                            content_str = st.get("content", "")
-                            supports = []
-                            if "rootdir" in content_str:
-                                supports.append("LXC rootfs")
-                            if "images" in content_str:
-                                supports.append("VM disks")
-                            if "vztmpl" in content_str:
-                                supports.append("LXC Templates")
-                            if "iso" in content_str:
-                                supports.append("ISO Images")
-                            if "backup" in content_str:
-                                supports.append("Backups")
-                            st["suitable_for"] = supports
-                            all_storage.append(st)
+                            all_storage.append(_annotate_storage_pool(st, n))
             return {"ok": True, "data": all_storage, "command": f"storage list ({node or 'all nodes'})"}
 
         # Auto-stop running container/VM before deletion if user confirmed deletion
@@ -539,6 +543,94 @@ class ProxmoxToolExecutor:
                 "total_os_tarballs": len(os_tarballs),
                 "usage": "vm_templates -> vm_clone; lxc_templates (template:1 VMIDs) -> lxc_clone; lxc_os_tarballs (storage:vztmpl/...) -> lxc_create. Never pass a template VMID as --ostemplate.",
                 "command": f"templates list ({kind})"
+            }
+
+        # Fresh cluster overview: nodes, storage, bridges, placement, next ID.
+        # Executor-aggregated like templates_list (no single CLI command).
+        if tool_name == "cluster_summary":
+            only = arguments.get("node")
+            target_nodes = [only] if only else self._get_cluster_nodes()
+            nodes: List[Dict[str, Any]] = []
+            nodes_res = self._raw_execute(["nodes", "list"])
+            if nodes_res.get("ok") and isinstance(nodes_res.get("data"), list):
+                for item in nodes_res["data"]:
+                    if isinstance(item, dict) and (not only or item.get("node") == only):
+                        nodes.append({
+                            key: item.get(key)
+                            for key in ("node", "status")
+                            if item.get(key) is not None
+                        })
+            storage: List[Dict[str, Any]] = []
+            networks: List[Dict[str, Any]] = []
+            lxcs: List[Dict[str, Any]] = []
+            vms: List[Dict[str, Any]] = []
+            seen_pools: Dict[Any, Dict[str, Any]] = {}
+            for n in target_nodes:
+                st_res = self._raw_execute(["storage", "list", "--node", n])
+                if st_res.get("ok") and isinstance(st_res.get("data"), list):
+                    for st in st_res["data"]:
+                        if isinstance(st, dict) and st.get("storage"):
+                            name = st["storage"]
+                            # Only shared pools are the same pool on both nodes;
+                            # node-local pools that share a name are distinct.
+                            key = name if st.get("shared") else (name, n)
+                            if key in seen_pools:
+                                # Same pool visible from another node: record
+                                # the extra node instead of repeating the row.
+                                nodes_seen = seen_pools[key].setdefault("nodes", [])
+                                if n not in nodes_seen:
+                                    nodes_seen.append(n)
+                                continue
+                            row = _annotate_storage_pool(
+                                {k: st.get(k) for k in ("storage", "type", "content", "shared", "suitable_for")
+                                 if st.get(k) is not None},
+                                n,
+                            )
+                            row["nodes"] = [n]
+                            seen_pools[key] = row
+                            storage.append(row)
+                net_res = self._raw_execute(["network", "list", "--node", n])
+                if net_res.get("ok") and isinstance(net_res.get("data"), list):
+                    for iface in net_res["data"]:
+                        if isinstance(iface, dict):
+                            row = {
+                                key: iface.get(key)
+                                for key in ("iface", "type", "active", "cidr")
+                                if iface.get(key) is not None
+                            }
+                            row.setdefault("node", n)
+                            networks.append(row)
+                for res_type, bucket in (("lxcs", lxcs), ("vms", vms)):
+                    list_res = self._raw_execute([res_type, "list", "--node", n])
+                    if list_res.get("ok") and isinstance(list_res.get("data"), list):
+                        for entry in list_res["data"]:
+                            if isinstance(entry, dict):
+                                bucket.append({
+                                    key: entry.get(key)
+                                    for key in ("vmid", "name", "status", "template")
+                                    if entry.get(key) is not None
+                                } | {"node": n})
+            next_id = None
+            nid_res = self._raw_execute(["vms", "next-id"])
+            if nid_res.get("ok") and isinstance(nid_res.get("data"), dict):
+                next_id = nid_res["data"].get("next_id")
+            return {
+                "ok": True,
+                "data": {
+                    "nodes": nodes,
+                    "next_id": next_id,
+                    "storage": storage,
+                    "networks": networks,
+                    "lxcs": lxcs,
+                    "vms": vms,
+                },
+                "usage": (
+                    "Fresh cluster facts: use for pool/bridge/placement/ID choices instead of "
+                    "re-listing. Re-verify with a live tool right before any mutating call. "
+                    "Never pass a template VMID as --ostemplate; omit --storage when "
+                    "linked-cloning an LXC template."
+                ),
+                "command": f"cluster summary ({only or 'all nodes'})",
             }
 
         try:
